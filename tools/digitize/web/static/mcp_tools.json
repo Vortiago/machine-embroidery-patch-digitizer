@@ -1,0 +1,51 @@
+[
+ {
+  "name": "slice",
+  "title": "Slice the picture",
+  "description": "Turn the picture into the Region map: key-background and vectorize, about 3 to 5 s, no stitches yet. Returns the result of every stitch type override (applied, refused with its coverage %, orphaned, shadowed). Settings left out keep their last value.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "hoop": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2,
+             "description": "Hoop in mm, [120, 120] or [260, 200]."},
+    "size_mm": {"type": ["number", "null"], "description": "Patch size in mm; null fills the hoop."},
+    "colors": {"type": "integer", "enum": [4, 6, 8]},
+    "key_background": {"type": "boolean", "description": "Remove a plain background first."},
+    "overrides": {
+     "type": "array",
+     "description": "Stitch type overrides, each a point in source picture pixels (x right, y down) and the stitch type for the Region holding it. Replaces the current list; [] clears it.",
+     "items": {
+      "type": "object",
+      "properties": {
+       "at_px": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
+       "type": {"type": "string", "enum": ["satin", "fill"]}
+      },
+      "required": ["at_px", "type"]
+     }
+    }
+   }
+  },
+  "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false}
+ },
+ {
+  "name": "make_stitch_plan",
+  "title": "Make the stitch plan",
+  "description": "Export the last Slice to VP3 through Ink/Stitch and render the Stitch plan. About 10 s on a warm cache, up to many minutes cold. Waits up to wait_s seconds (default 60); when the export still runs, call status later.",
+  "inputSchema": {"type": "object", "properties": {"wait_s": {"type": "number", "minimum": 0}}},
+  "annotations": {"readOnlyHint": false, "destructiveHint": false, "openWorldHint": false}
+ },
+ {
+  "name": "status",
+  "title": "Job status",
+  "description": "The current job: state (idle, slicing, exporting, failed, cancelled), stage, elapsed time, the last Slice with its override results, and the Stitch plan (stitches, size, threads, warnings) when one exists.",
+  "inputSchema": {"type": "object", "properties": {}},
+  "annotations": {"readOnlyHint": true, "openWorldHint": false}
+ },
+ {
+  "name": "cancel",
+  "title": "Cancel the running job",
+  "description": "Stop the running Slice or export and every process it started.",
+  "inputSchema": {"type": "object", "properties": {}},
+  "annotations": {"readOnlyHint": false, "destructiveHint": true, "openWorldHint": false}
+ }
+]

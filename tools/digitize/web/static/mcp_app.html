@@ -67,6 +67,7 @@
 (function () {
   'use strict';
   var LOCKED = { outline: 1, border: 1, gradient: 1, run: 1 };
+  var INKSTITCH_NS = 'http://inkstitch.org/namespace';
   var nextId = 1, pending = {}, state = { overrides: [], svg: null, busy: false, at: null, path: null };
 
   function $(id) { return document.getElementById(id); }
@@ -127,16 +128,19 @@
     $('busy').textContent = state.busy ? 'Still running: press Refresh.' : '';
     if (report.slice) {
       show($('slice'), true);
-      state.overrides = (report.slice.overrides || []).map(function (o) {
-        return { at_px: o.at_px, type: o.type, status: o.status, reason: o.reason };
-      });
+      state.overrides = report.slice.overrides || [];
       if (view && view.svg) { mountMap(view.svg, view.kinds || null); }
       else if (!state.svg) { $('map').textContent = 'The Region map is too large to show here: ' + report.slice.svg; }
       renderOverrides();
     }
     if (report.stitchplan) { renderPlan(report.stitchplan, result.content || [], view); }
-    ['btn-slice', 'btn-plan'].forEach(function (id) { $(id).disabled = state.busy; });
+    setBusy(state.busy);
     resized();
+  }
+
+  function setBusy(on) {
+    state.busy = on;
+    ['btn-slice', 'btn-plan'].forEach(function (id) { $(id).disabled = on; });
   }
 
   function showError(text) { $('error').textContent = text; show($('error'), !!text); resized(); }
@@ -167,8 +171,13 @@
     if (group === 'border') { return 'border'; }
     if (group === 'outlines') { return 'outline'; }
     if (/fill\s*:\s*url\(/.test(path.getAttribute('style') || '')) { return 'gradient'; }
+    /* the page's rule (app.js kindFromSvg): a satin column inside a colour group */
+    if ((path.hasAttributeNS(INKSTITCH_NS, 'satin_column') ||
+        path.getAttribute('inkstitch:satin_column') !== null) && /^color\d+$/.test(group)) {
+      return 'satinized';
+    }
     if (/^r\d/.test(path.id || '')) { return 'run'; }
-    return /^s\d/.test(path.id || '') ? 'satinized' : 'fill';
+    return 'fill';
   }
 
   function renderOverrides() {
@@ -247,31 +256,25 @@
     (plan.removed_by_precheck || []).forEach(function (id) {
       warnings.appendChild(make('li', null, 'Removed by the satin precheck: ' + id));
     });
-    var img = (content || []).filter(function (c) { return c.type === 'image'; });
-    var host = $('planimg');
-    if (view && view.images && img.length) {
-      var at = view.images.indexOf('stitchplan');
-      if (at >= 0 && img[at]) {
-        host.textContent = '';
-        var el = make('img');
-        el.alt = 'Stitch plan';
-        el.src = 'data:' + img[at].mimeType + ';base64,' + img[at].data;
-        el.addEventListener('load', resized);
-        host.appendChild(el);
-      }
+    var img = (content || []).filter(function (c) { return c.type === 'image'; })[0];
+    if (view && view.plan_image && img) {
+      var el = make('img');
+      el.alt = 'Stitch plan';
+      el.src = 'data:' + img.mimeType + ';base64,' + img.data;
+      el.addEventListener('load', resized);
+      $('planimg').textContent = '';
+      $('planimg').appendChild(el);
     }
   }
 
   /* ---- buttons: the server's own tools, through the chat client ---- */
 
   function callTool(name, args) {
-    state.busy = true;
-    ['btn-slice', 'btn-plan'].forEach(function (id) { $(id).disabled = true; });
+    setBusy(true);
     $('busy').textContent = 'Working...';
     return request('tools/call', { name: name, arguments: args || {} }).then(render, function (err) {
-      state.busy = false;
+      setBusy(false);
       $('busy').textContent = '';
-      ['btn-slice', 'btn-plan'].forEach(function (id) { $(id).disabled = false; });
       showError(err.message);
     });
   }

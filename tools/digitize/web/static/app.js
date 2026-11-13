@@ -1029,23 +1029,34 @@
   }
 
   /* ---- WebMCP: the same tools as tools/digitize/web/mcp_server.py, for a browser agent ----
-     The page registers slice, make_stitch_plan, status and cancel with the browser's model
-     context (document.modelContext in the current WebMCP draft, navigator.modelContext in
-     earlier builds). Each tool presses the same buttons the operator does, so the Region map
-     and the Stitch plan draw on screen while the agent works. Without WebMCP nothing runs. */
+     The tool list is static/mcp_tools.json, shared with the stdio server. The page registers
+     them with the browser's model context (document.modelContext in the current WebMCP
+     draft, navigator.modelContext in earlier builds). Each tool runs the same doSlice,
+     doStitchplan or doCancel as the buttons, so the Region map and the Stitch plan draw on
+     screen while the agent works. Without WebMCP nothing here runs. */
 
   var WEBMCP_SLICE_WAIT_MS = 120000;
   var WEBMCP_PLAN_WAIT_MS = 60000;
 
+  /* Refresh until the job ends or maxMs passes; the page's own poller takes over after. */
   function waitIdle(maxMs) {
+    stopPolling();
     var end = Date.now() + maxMs;
     function step() {
       return refreshStatus().then(function (status) {
-        if (!isBusy() || Date.now() >= end) { return status; }
+        if (!isBusy() || Date.now() >= end) { startPolling(); return status; }
         return new Promise(function (resolve) { setTimeout(resolve, POLL_MS); }).then(step);
       });
     }
     return step();
+  }
+
+  /* An action ran through runAction, which keeps a failure in state.actionError. */
+  function thenWait(maxMs) {
+    return function () {
+      if (state.actionError) { throw new Error(state.actionError); }
+      return waitIdle(maxMs);
+    };
   }
 
   function toolReport(status) {
@@ -1061,7 +1072,7 @@
         slice_id: plan.slice_id, stitches: plan.stitches, width_mm: plan.width_mm,
         height_mm: plan.height_mm, threads: plan.threads, warnings: plan.warnings,
         removed_by_precheck: plan.removed_by_precheck, vp3_url: plan.vp3_url,
-        stitchplan_url: plan.stitchplan_url,
+        stitchplan_url: plan.stitchplan_url, coverage_url: plan.coverage_url,
         stale: !!status.slice && plan.slice_id !== status.slice.slice_id      /* E7 */
       };
     }
@@ -1069,26 +1080,18 @@
     if (!status.slice) { return Promise.resolve(out); }
     var slice = status.slice;
     out.slice = { slice_id: slice.slice_id, hoop: slice.hoop, svg_url: slice.svg_url };
-    return readRegions(slice).then(function (regions) {
+    var drawn = state.mapKey === slice.svg_url && state.reported;
+    return (drawn ? Promise.resolve(state.regions) : readRegions(slice)).then(function (regions) {
       out.slice.overrides = (regions && Array.isArray(regions.overrides)) ? regions.overrides :
         (slice.overrides || []).map(function (o) { return { at_px: o.at_px, type: o.type, status: 'pending' }; });
       return out;
     });
   }
 
-  function toolResult(promise) {
-    return promise.then(function (value) {
-      return { content: [{ type: 'text', text: JSON.stringify(value, null, 1) }] };
-    }, function (err) {
-      return { content: [{ type: 'text', text: err.message }], isError: true };
-    });
-  }
-
   function setChecked(name, value) {
     var input = document.querySelector('input[name="' + name + '"][value="' + value + '"]');
-    if (!input) { return false; }
-    input.checked = true;
-    return true;
+    if (input) { input.checked = true; }
+    return !!input;
   }
 
   /* Tool arguments set the sidebar controls first, so the page shows what was sliced. */
@@ -1099,121 +1102,70 @@
       if (index < 0) { throw new Error('hoop must be one of ' + JSON.stringify(hoops) + '.'); }
       setChecked('hoop', String(index));
     }
-    if (args.size_mm === null) { $('in-fill-hoop').checked = true; }
-    if (typeof args.size_mm === 'number') { $('in-fill-hoop').checked = false; $('in-size').value = args.size_mm; }
-    $('in-size').disabled = $('in-fill-hoop').checked;
     if (args.colors !== undefined && !setChecked('color', String(args.colors))) {
       throw new Error('colors must be 4, 6 or 8.');
+    }
+    if (args.size_mm !== undefined) {
+      $('in-fill-hoop').checked = args.size_mm === null;
+      if (args.size_mm !== null) { $('in-size').value = args.size_mm; }
+      $('in-fill-hoop').dispatchEvent(new Event('change'));
     }
     if (typeof args.key_background === 'boolean') { $('in-keybg').checked = args.key_background; }
     if (Array.isArray(args.overrides)) {
       state.overrides = normaliseOverrides(args.overrides);
-      renderOverrides();
+      afterOverrideChange();
     }
   }
 
-  function webmcpSlice(args) {
-    if (!state.status || !state.status.picture) {
-      return Promise.reject(new Error('No picture yet: the operator loads one in the page first.'));
-    }
-    if (isBusy()) { return Promise.reject(new Error('A job is already running. Call status, or cancel it first.')); }
-    try { applySliceArgs(args || {}); } catch (err) { return Promise.reject(err); }
-    hidePopover();
-    return postJson('/api/slice', sliceBody()).then(function () {
-      startPolling();
-      return waitIdle(WEBMCP_SLICE_WAIT_MS);
-    }).then(toolReport);
+  function notBusy() {
+    if (isBusy()) { throw new Error('A job is already running. Call status, or cancel it first.'); }
   }
 
-  function webmcpPlan(args) {
-    if (isBusy()) { return Promise.reject(new Error('A job is already running. Call status, or cancel it first.')); }
-    var wait = (args && typeof args.wait_s === 'number') ? args.wait_s * 1000 : WEBMCP_PLAN_WAIT_MS;
-    return api('/api/stitchplan', { method: 'POST' }).then(function () {
-      startPolling();
+  var WEBMCP_RUN = {
+    slice: function (args) {
+      if (!state.status || !state.status.picture) {
+        throw new Error('No picture yet: the operator loads one in the page first.');
+      }
+      notBusy();
+      applySliceArgs(args || {});
+      return doSlice().then(thenWait(WEBMCP_SLICE_WAIT_MS)).then(toolReport);
+    },
+    make_stitch_plan: function (args) {
+      notBusy();
+      var wait = (args && typeof args.wait_s === 'number') ? args.wait_s * 1000 : WEBMCP_PLAN_WAIT_MS;
       switchTab('stitchplan');
-      return waitIdle(wait);
-    }).then(toolReport);
-  }
-
-  var OVERRIDES_SCHEMA = {
-    type: 'array',
-    description: 'Stitch type overrides: a point in source picture pixels (x right, y down) and ' +
-      'the stitch type for the Region holding it. Replaces the list on the page; [] clears it.',
-    items: {
-      type: 'object',
-      properties: {
-        at_px: { type: 'array', items: { type: 'number' }, minItems: 2, maxItems: 2 },
-        type: { type: 'string', enum: ['satin', 'fill'] }
-      },
-      required: ['at_px', 'type']
+      return doStitchplan().then(thenWait(wait)).then(toolReport);
+    },
+    status: function () { return refreshStatus().then(toolReport); },
+    cancel: function () {
+      return doCancel().then(function () {
+        if (state.actionError) { throw new Error(state.actionError); }
+        return { cancelled: runState() === 'cancelled' };
+      });
     }
   };
 
-  var WEBMCP_TOOLS = [
-    {
-      name: 'slice',
-      title: 'Slice the picture',
-      description: 'Slice the picture loaded in the page into the Region map (about 3 to 5 s, ' +
-        'no stitches yet) and return the result of every stitch type override. Settings left ' +
-        'out keep what the page shows.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          hoop: { type: 'array', items: { type: 'number' }, minItems: 2, maxItems: 2,
-                  description: 'Hoop in mm, [120, 120] or [260, 200].' },
-          size_mm: { type: ['number', 'null'], description: 'Patch size in mm; null fills the hoop.' },
-          colors: { type: 'integer', enum: [4, 6, 8] },
-          key_background: { type: 'boolean', description: 'Remove a plain background first.' },
-          overrides: OVERRIDES_SCHEMA
-        }
-      },
-      annotations: { readOnlyHint: false },
-      execute: function (args) { return toolResult(webmcpSlice(args)); }
-    },
-    {
-      name: 'make_stitch_plan',
-      title: 'Make the stitch plan',
-      description: 'Export the last Slice to VP3 through Ink/Stitch and show the Stitch plan. ' +
-        'About 10 s on a warm cache, up to many minutes cold; waits up to wait_s seconds.',
-      inputSchema: { type: 'object', properties: { wait_s: { type: 'number', minimum: 0 } } },
-      annotations: { readOnlyHint: false },
-      execute: function (args) { return toolResult(webmcpPlan(args)); }
-    },
-    {
-      name: 'status',
-      title: 'Job status',
-      description: 'The current job: state, stage, elapsed time, the last Slice with its ' +
-        'override results, and the Stitch plan (stitches, size, threads, warnings).',
-      inputSchema: { type: 'object', properties: {} },
-      annotations: { readOnlyHint: true },
-      execute: function () { return toolResult(refreshStatus().then(toolReport)); }
-    },
-    {
-      name: 'cancel',
-      title: 'Cancel the running job',
-      description: 'Stop the running Slice or export.',
-      inputSchema: { type: 'object', properties: {} },
-      annotations: { readOnlyHint: false },
-      execute: function () { return toolResult(postJson('/api/cancel', {}).then(function (body) {
-        afterAction();
-        return body;
-      })); }
-    }
-  ];
+  function execute(name) {
+    return function (args) {
+      return Promise.resolve().then(function () { return WEBMCP_RUN[name](args); }).then(function (value) {
+        return { content: [{ type: 'text', text: JSON.stringify(value, null, 1) }] };
+      }, function (err) {
+        return { content: [{ type: 'text', text: err.message }], isError: true };
+      });
+    };
+  }
 
   function registerWebMcp() {
     var context = document.modelContext || navigator.modelContext;
     if (!context || typeof context.registerTool !== 'function') { return; }
-    WEBMCP_TOOLS.forEach(function (tool) {
-      try {
-        var done = context.registerTool(tool);
-        if (done && typeof done.catch === 'function') {
-          done.catch(function (err) { console.warn('WebMCP: ' + tool.name + ' not registered: ' + err.message); });
-        }
-      } catch (err) {
-        console.warn('WebMCP: ' + tool.name + ' not registered: ' + err.message);
-      }
-    });
+    api('/static/mcp_tools.json').then(function (tools) {
+      tools.forEach(function (tool) {
+        tool.execute = execute(tool.name);
+        Promise.resolve().then(function () { return context.registerTool(tool); }).catch(function (err) {
+          console.warn('WebMCP: ' + tool.name + ' not registered: ' + err.message);
+        });
+      });
+    }).catch(function (err) { console.warn('WebMCP: no tool list: ' + err.message); });
   }
 
   wire();

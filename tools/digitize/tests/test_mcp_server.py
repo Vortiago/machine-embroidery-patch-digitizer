@@ -82,6 +82,7 @@ class AppView(McpTestCase):
         for name in ("slice", "make_stitch_plan", "status"):
             self.assertEqual(tools[name]["_meta"]["ui"]["resourceUri"], mcp_server.VIEW_URI)
         self.assertNotIn("_meta", tools["cancel"])
+        self.assertIn("picture", tools["slice"]["inputSchema"]["properties"])     # stdio only
 
     def test_resources(self):
         listed = self.request("resources/list")["result"]["resources"]
@@ -99,10 +100,10 @@ class AppView(McpTestCase):
         view = reply["result"]["_meta"]["digitize/view"]
         self.assertIn('<path id="f0"', view["svg"])
         self.assertEqual(view["kinds"], {"f0": "fill"})
-        self.assertEqual(view["images"], ["posterized"])
+        self.assertNotIn("plan_image", view)                      # the picture is the posterized one
         with self.measured():
             reply = self.request("tools/call", {"name": "make_stitch_plan", "arguments": {}})
-        self.assertEqual(reply["result"]["_meta"]["digitize/view"]["images"], ["stitchplan"])
+        self.assertTrue(reply["result"]["_meta"]["digitize/view"]["plan_image"])
 
 
 class SliceTool(McpTestCase):

@@ -25,7 +25,9 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+from werkzeug.serving import make_server
 
 from tools.digitize.web import server
 
@@ -38,88 +40,31 @@ VIEW_URI = "ui://digitize/view.html"
 VIEW_MIME = "text/html;profile=mcp-app"
 VIEW_FILE = Path(__file__).resolve().parent / "static" / "mcp_app.html"
 VIEW_SVG_MAX = 2_000_000       # bytes of Region map SVG sent to the view; larger is left out
-UI_META = {"ui": {"resourceUri": VIEW_URI}}
 
-OVERRIDES_SCHEMA = {
-    "type": "array",
-    "description": "Stitch type overrides, each a point in source picture pixels (x right, "
-                   "y down) and the stitch type for the Region holding it. Replaces the list "
-                   "the last Slice used; [] clears it. Left out: keep the last list.",
-    "items": {
-        "type": "object",
-        "properties": {
-            "at_px": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2},
-            "type": {"type": "string", "enum": ["satin", "fill"]},
-        },
-        "required": ["at_px", "type"],
-    },
-}
+TOOLS_FILE = Path(__file__).resolve().parent / "static" / "mcp_tools.json"
 
-TOOLS: List[Dict[str, Any]] = [
-    {
-        "name": "slice",
-        "title": "Slice a picture",
-        "description": (
-            "Turn a raster picture into the Region map: key-background and vectorize, about "
-            "3 to 5 s, no stitches yet. Returns the result of every stitch type override "
-            "(applied, refused with its coverage %, orphaned, shadowed) and the files made. "
-            "Settings left out keep their value from the last Slice in this session."),
-        "inputSchema": {
-            "type": "object",
-            "properties": {
+
+def load_tools() -> List[Dict[str, Any]]:
+    """The tool list shared with the page's WebMCP tools (static/mcp_tools.json), plus what
+    only the stdio server has: picture and config paths, and the MCP App view."""
+    tools = json.loads(TOOLS_FILE.read_text(encoding="utf-8"))
+    for tool in tools:
+        if tool["name"] == "slice":
+            tool["inputSchema"]["properties"].update({
                 "picture": {"type": "string", "description":
                             "Path to a png, jpg, jpeg or webp file. Needed on the first call; "
                             "a new picture clears the overrides."},
-                "hoop": {"type": "array", "items": {"type": "number"}, "minItems": 2,
-                         "maxItems": 2, "description": "Hoop in mm, [120, 120] or [260, 200]."},
-                "size_mm": {"type": ["number", "null"], "description":
-                            "Patch size in mm; null fills the hoop. Default 100."},
-                "colors": {"type": "integer", "enum": [4, 6, 8]},
-                "key_background": {"type": "boolean",
-                                   "description": "Remove a plain background first."},
                 "config": {"type": "string", "description":
                            "Path to a YAML config (palette, profile, satinize, ...)."},
                 "yaml_text": {"type": "string", "description": "YAML config as text."},
-                "overrides": OVERRIDES_SCHEMA,
-            },
-        },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
-        "_meta": UI_META,
-    },
-    {
-        "name": "make_stitch_plan",
-        "title": "Make the stitch plan",
-        "description": (
-            "Export the last Slice's SVG to VP3 through Ink/Stitch and render the Stitch plan. "
-            "Takes about 10 s on a warm cache and up to many minutes cold. Waits up to wait_s "
-            "seconds; when the export is still running, call status later."),
-        "inputSchema": {
-            "type": "object",
-            "properties": {"wait_s": {"type": "number", "minimum": 0,
-                                      "description": "Seconds to wait, default %d." % PLAN_WAIT_S}},
-        },
-        "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
-        "_meta": UI_META,
-    },
-    {
-        "name": "status",
-        "title": "Job status",
-        "description": (
-            "The current job: state (idle, slicing, exporting, failed, cancelled), stage, "
-            "elapsed time, the last Slice with its override results, and the Stitch plan "
-            "(stitches, size, threads, warnings) with its picture when one exists."),
-        "inputSchema": {"type": "object", "properties": {}},
-        "annotations": {"readOnlyHint": True, "openWorldHint": False},
-        "_meta": UI_META,
-    },
-    {
-        "name": "cancel",
-        "title": "Cancel the running job",
-        "description": "Stop the running Slice or export and every process it started.",
-        "inputSchema": {"type": "object", "properties": {}},
-        "annotations": {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": False},
-    },
-]
+            })
+        if tool["name"] != "cancel":
+            tool["_meta"] = {"ui": {"resourceUri": VIEW_URI}}
+    return tools
+
+
+TOOLS = load_tools()
+Report = Tuple[List[Dict[str, Any]], Dict[str, Any]]      # (content, view for the MCP App)
 
 
 class ToolError(Exception):
@@ -134,7 +79,6 @@ class Tools:
         self.client = app.test_client()
         # With --port the app checks Host against that port, so speak as its own page.
         self.base_url = "http://127.0.0.1:%d" % port if port else "http://127.0.0.1"
-        self.out_root = Path(app.job.out_root)
         self.settings: Dict[str, Any] = {}
         self.picture: Optional[Path] = None
         options = self._call("GET", "/api/options")
@@ -163,16 +107,16 @@ class Tools:
             time.sleep(POLL_S)
 
     def _file(self, url: Optional[str]) -> Optional[Path]:
-        """/files/<slug>/<name>?v=3 -> the file on disk, or None."""
-        if not url:
+        """A /files/<slug>/<name>?v=3 URL of the current job -> that file on disk, or None."""
+        jobdir = self.app.job.dir
+        if not url or jobdir is None:
             return None
-        slug, name = url.split("?", 1)[0].split("/")[2:4]
-        path = self.out_root / slug / name
+        path = jobdir / url.split("?", 1)[0].rsplit("/", 1)[-1]
         return path if path.is_file() else None
 
     # -- the tools ----------------------------------------------------------------------
 
-    def slice(self, args: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def slice(self, args: Dict[str, Any]) -> Report:
         picture = args.get("picture")
         if picture:
             path = Path(picture).expanduser().resolve()
@@ -192,38 +136,32 @@ class Tools:
                 args = dict(args, yaml_text=config.read_text(encoding="utf-8"))
             except OSError as exc:
                 raise ToolError("The config %s could not be read (%s)." % (config, exc))
-        wanted = dict(self.defaults)
-        wanted.update(self.settings)
-        for key in self.defaults:
-            if key in args:
-                wanted[key] = args[key]
-        body = {k: wanted[k] for k in self.defaults}
+        body = {k: args.get(k, self.settings.get(k, v)) for k, v in self.defaults.items()}
         self._call("POST", "/api/slice", json=body)
         self.settings = body
-        status = self._wait(SLICE_WAIT_S)
-        return self._report(status, "slice")
+        return self._report(self._wait(SLICE_WAIT_S), after_slice=True)
 
-    def make_stitch_plan(self, args: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def make_stitch_plan(self, args: Dict[str, Any]) -> Report:
         self._call("POST", "/api/stitchplan")
         wait_s = args.get("wait_s")
-        status = self._wait(PLAN_WAIT_S if wait_s is None else float(wait_s))
-        return self._report(status, "stitchplan")
+        return self._report(self._wait(PLAN_WAIT_S if wait_s is None else float(wait_s)))
 
-    def status(self, args: Dict[str, Any]) -> List[Dict[str, Any]]:
-        return self._report(self._call("GET", "/api/status"), "status")
+    def status(self, args: Dict[str, Any]) -> Report:
+        return self._report(self._call("GET", "/api/status"))
 
-    def cancel(self, args: Dict[str, Any]) -> List[Dict[str, Any]]:
+    def cancel(self, args: Dict[str, Any]) -> Report:
         return [text(self._call("POST", "/api/cancel"))], {}
 
     # -- what a call returns ------------------------------------------------------------
 
-    def _report(self, status: Dict[str, Any], asked: str):
+    def _report(self, status: Dict[str, Any], after_slice: bool = False) -> Report:
         """The status, with file paths in place of page URLs, override results and pictures.
 
         Returns (content, view): view goes in the result's _meta for the MCP App, which
         draws the Region map from the SVG and object kinds and cannot fetch files itself.
+        After a Slice the picture is the posterized preview, otherwise the Stitch plan.
         """
-        view: Dict[str, Any] = {"images": []}
+        view: Dict[str, Any] = {}
         out: Dict[str, Any] = {k: status.get(k) for k in ("state", "stage", "elapsed_s", "error")}
         if status["state"] == "failed":
             out["log_tail"] = status.get("log_tail")
@@ -231,65 +169,58 @@ class Tools:
             out["picture"] = {"path": str(self._file(status["picture"]["url"]) or ""),
                               "width": status["picture"]["width"],
                               "height": status["picture"]["height"]}
-        images: List[Path] = []
+        image: Optional[Path] = None
         sl = status.get("slice")
         if sl:
-            regions = self._file(sl.get("regions_url"))
+            svg, regions_file = self._file(sl["svg_url"]), self._file(sl.get("regions_url"))
+            regions = read_json(regions_file)
+            reported = regions.get("overrides")
             out["slice"] = {
                 "slice_id": sl["slice_id"], "hoop": sl["hoop"],
-                "svg": str(self._file(sl["svg_url"]) or ""),
-                "regions": str(regions or ""),
-                "overrides": self._override_results(sl, regions),
+                "svg": str(svg or ""), "regions": str(regions_file or ""),
+                # what the pipeline did with each override, else what was sent
+                "overrides": reported if isinstance(reported, list) else
+                [dict(o, status="pending") for o in sl.get("overrides") or []],
             }
-            svg = self._file(sl["svg_url"])
             if svg and svg.stat().st_size <= VIEW_SVG_MAX:
                 view["svg"] = svg.read_text(encoding="utf-8", errors="replace")
-            view["kinds"] = self._kinds(regions)
-            if asked == "slice" and self._file(sl.get("posterized_url")):
-                images.append(self._file(sl["posterized_url"]))
-                view["images"].append("posterized")
+            objects = regions.get("objects")
+            if isinstance(objects, list):
+                view["kinds"] = {o["id"]: o["kind"] for o in objects
+                                 if isinstance(o, dict) and "id" in o and "kind" in o}
+            if after_slice:
+                image = self._file(sl.get("posterized_url"))
         plan = status.get("stitchplan")
         if plan:
+            plan_png = self._file(plan["stitchplan_url"])
             out["stitchplan"] = dict(
                 {k: plan.get(k) for k in ("slice_id", "stitches", "width_mm", "height_mm",
                                           "threads", "warnings", "removed_by_precheck")},
                 stale=bool(sl) and plan["slice_id"] != sl["slice_id"],       # E7
                 vp3=str(self._file(plan["vp3_url"]) or ""),
-                stitchplan_png=str(self._file(plan["stitchplan_url"]) or ""),
+                stitchplan_png=str(plan_png or ""),
                 coverage_png=str(self._file(plan["coverage_url"]) or ""))
-            if asked != "slice" and self._file(plan["stitchplan_url"]):
-                images.append(self._file(plan["stitchplan_url"]))
-                view["images"].append("stitchplan")
+            if not after_slice and plan_png:
+                image = plan_png
+                view["plan_image"] = True
         if status["state"] in server.RUNNING_STATES:
             out["note"] = "Still running. Call status again later."
         content = [text(out)]
-        for path in images:
+        if image:
             content.append({"type": "image", "mimeType": "image/png",
-                            "data": base64.b64encode(path.read_bytes()).decode("ascii")})
+                            "data": base64.b64encode(image.read_bytes()).decode("ascii")})
         return content, view
 
-    @staticmethod
-    def _kinds(regions: Optional[Path]) -> Optional[Dict[str, str]]:
-        """Object id -> kind from regions.json, or None (the view then reads the SVG)."""
-        if not regions:
-            return None
-        try:
-            objects = json.loads(regions.read_text(encoding="utf-8")).get("objects") or []
-            return {o["id"]: o["kind"] for o in objects if "id" in o and "kind" in o}
-        except (OSError, ValueError, AttributeError, TypeError, KeyError):
-            return None
 
-    @staticmethod
-    def _override_results(sl: Dict[str, Any], regions: Optional[Path]) -> List[Dict[str, Any]]:
-        """What the pipeline did with each override (regions.json), else what was sent."""
-        if regions:
-            try:
-                reported = json.loads(regions.read_text(encoding="utf-8")).get("overrides")
-                if isinstance(reported, list):
-                    return reported
-            except (OSError, ValueError):
-                pass
-        return [dict(o, status="pending") for o in sl.get("overrides") or []]
+def read_json(path: Optional[Path]) -> Dict[str, Any]:
+    """A JSON object from a file, or {} when there is none or it does not parse."""
+    if not path:
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def text(value: Any) -> Dict[str, Any]:
@@ -405,14 +336,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ns = ap.parse_args(args)
     app = server.create_app(server.REPO_ROOT, port=ns.port)
     if ns.port:
-        import flask.cli
-        flask.cli.show_server_banner = lambda *a, **k: None    # it prints to stdout
-        threading.Thread(target=app.run, name="digitize-web-page", daemon=True,
-                         kwargs={"host": "127.0.0.1", "port": ns.port, "threaded": True,
-                                 "debug": False, "use_reloader": False}).start()
+        # make_server prints no banner, so stdout stays protocol only; request logs go to stderr.
+        page = make_server("127.0.0.1", ns.port, app, threaded=True)
+        threading.Thread(target=page.serve_forever, name="digitize-web-page", daemon=True).start()
         print("Digitize Patches page: http://127.0.0.1:%d/" % ns.port, file=sys.stderr)
-    sys.stderr.flush()
-    # Flask's startup banner and request log go to stderr; stdout stays protocol only.
+        sys.stderr.flush()
     StdioServer(Tools(app, ns.port)).serve(sys.stdin)
     return 0
 
