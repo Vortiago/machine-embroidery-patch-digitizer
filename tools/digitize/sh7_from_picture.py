@@ -26,12 +26,14 @@ import argparse
 import math
 import sys
 
-import networkx as nx
 import numpy as np
 from PIL import Image, ImageDraw
+from scipy import sparse
+from scipy.sparse import csgraph
 from skimage import measure, morphology
 
 import sh7_writer as sw
+from gradient import regions
 
 
 def line_mask(img: Image.Image, threshold: int = 128) -> np.ndarray:
@@ -45,96 +47,128 @@ def line_mask(img: Image.Image, threshold: int = 128) -> np.ndarray:
 
 
 def largest_part(mask: np.ndarray):
-    labels = measure.label(mask, connectivity=2)
-    if labels.max() == 0:
+    """The largest 8-connected part of the mask, and how many others there are."""
+    parts = regions(mask, 1)
+    if not parts:
         raise sw.Sh7Error("the picture has no line pixels")
-    sizes = np.bincount(labels.ravel())
-    sizes[0] = 0
-    keep = int(sizes.argmax())
-    return labels == keep, int(labels.max()) - 1
+    return parts[0], len(parts) - 1
 
 
-def skeleton_tree(mask: np.ndarray) -> nx.Graph:
-    """The line's 1 px skeleton as a tree of pixels (x, y).
+class SkeletonTree:
+    """The line's 1 px skeleton as a spanning tree over its pixels.
 
-    A spanning tree drops one pixel step from each closed loop (a gap far
-    below a stitch length) and lets the walk below exist for any drawing.
-    Spurs shorter than about one and a half line widths are skeleton noise
-    from the line's edges and are pruned."""
-    skel = morphology.skeletonize(mask)
-    ys, xs = np.nonzero(skel)
-    if len(xs) == 0:
-        raise sw.Sh7Error("the line is too thin to trace")
-    pixels = set(zip(xs.tolist(), ys.tolist()))
-    g = nx.Graph()
-    g.add_nodes_from(pixels)
-    for x, y in pixels:
+    ``xy[i]`` is pixel i as (x, y); ``adj[i]`` lists its tree neighbours, and
+    a pruned pixel has an empty list.  A spanning tree drops one pixel step
+    from each closed loop (a gap far below a stitch length) so the walk below
+    exists for any drawing."""
+
+    def __init__(self, mask: np.ndarray):
+        skel = morphology.skeletonize(mask)
+        ys, xs = np.nonzero(skel)
+        n = len(xs)
+        if n == 0:
+            raise sw.Sh7Error("the line is too thin to trace")
+        self.xy = np.column_stack([xs, ys])
+        index = np.full(skel.shape, -1, dtype=np.int64)
+        index[ys, xs] = np.arange(n)
+        # 8-neighbour edges, each found once: right, down, down-right, up-right.
+        h, w = skel.shape
+        rows, cols, weights = [], [], []
         for dx, dy in ((1, 0), (0, 1), (1, 1), (1, -1)):
-            q = (x + dx, y + dy)
-            if q in pixels:
-                g.add_edge((x, y), q, weight=math.hypot(dx, dy))
-    tree = nx.minimum_spanning_tree(g)
-    width = mask.sum() / max(1, len(pixels))
-    _prune_spurs(tree, 1.5 * width)
-    return tree
+            nx_, ny_ = xs + dx, ys + dy
+            ok = (nx_ < w) & (ny_ >= 0) & (ny_ < h)
+            other = np.full(n, -1, dtype=np.int64)
+            other[ok] = index[ny_[ok], nx_[ok]]
+            hit = other >= 0
+            rows.append(np.nonzero(hit)[0])
+            cols.append(other[hit])
+            weights.append(np.full(hit.sum(), math.hypot(dx, dy)))
+        graph = sparse.coo_matrix((np.concatenate(weights),
+                                   (np.concatenate(rows), np.concatenate(cols))), shape=(n, n))
+        tree = csgraph.minimum_spanning_tree(graph).tocoo()
+        self.adj = [[] for _ in range(n)]
+        for i, j in zip(tree.row.tolist(), tree.col.tolist()):
+            self.adj[i].append(j)
+            self.adj[j].append(i)
+        # Spurs shorter than about one and a half line widths are skeleton
+        # noise from the line's edges.
+        self.prune_spurs(1.5 * mask.sum() / n)
+
+    def prune_spurs(self, max_len: float) -> None:
+        adj, xy = self.adj, self.xy
+        for _ in range(3):
+            removed = False
+            for leaf in [i for i, nb in enumerate(adj) if len(nb) == 1]:
+                if len(adj[leaf]) != 1:
+                    continue
+                chain, prev, cur, length = [leaf], None, leaf, 0.0
+                while length < max_len:
+                    nxt = [j for j in adj[cur] if j != prev]
+                    if len(nxt) != 1:
+                        break
+                    length += math.dist(xy[cur], xy[nxt[0]])
+                    prev, cur = cur, nxt[0]
+                    if len(adj[cur]) != 2:
+                        break
+                    chain.append(cur)
+                if len(adj[cur]) >= 3 and length < max_len:
+                    adj[cur].remove(chain[-1])
+                    for i in chain:
+                        adj[i] = []
+                    removed = True
+            if not removed:
+                return
+
+    def nodes(self):
+        return [i for i, nb in enumerate(self.adj) if nb]
 
 
-def _prune_spurs(tree: nx.Graph, max_len: float) -> None:
-    for _ in range(3):
-        removed = False
-        for leaf in [n for n in tree if tree.degree(n) == 1]:
-            if leaf not in tree or tree.degree(leaf) != 1:
-                continue
-            chain, cur, prev, length = [leaf], leaf, None, 0.0
-            while True:
-                nxt = [n for n in tree[cur] if n != prev]
-                if len(nxt) != 1:
-                    break
-                length += tree[cur][nxt[0]]["weight"]
-                prev, cur = cur, nxt[0]
-                if tree.degree(cur) != 2:
-                    break
-                chain.append(cur)
-            if tree.degree(cur) >= 3 and length < max_len:
-                tree.remove_nodes_from(chain)
-                removed = True
-        if not removed:
-            return
-
-
-def sewing_walk(tree: nx.Graph):
-    """One continuous walk over the tree, from its topmost pixel to its
-    bottommost.  The branch that leads to the bottom is sewn once; every other
-    branch is sewn out and back, so the stitch never has to jump."""
-    top = min(tree, key=lambda p: (p[1], p[0]))
-    bottom = max(tree, key=lambda p: (p[1], -p[0]))
-    on_main = set(nx.shortest_path(tree, top, bottom))
+def sewing_walk(tree: SkeletonTree):
+    """One continuous walk over the tree as (x, y) pixels, from its topmost
+    pixel to its bottommost.  The branch that leads to the bottom is sewn once;
+    every other branch is sewn out and back, so the stitch never has to jump."""
+    xy, adj = tree.xy, tree.adj
+    nodes = tree.nodes() or [0]
+    top = min(nodes, key=lambda i: (xy[i][1], xy[i][0]))
+    bottom = max(nodes, key=lambda i: (xy[i][1], -xy[i][0]))
+    # Parents from a walk out of the top; the main path is bottom's ancestry.
+    parent = {top: None}
+    order = [top]
+    for node in order:
+        for j in adj[node]:
+            if j not in parent:
+                parent[j] = node
+                order.append(j)
+    main_child = {}
+    node = bottom
+    while parent[node] is not None:
+        main_child[parent[node]] = node
+        node = parent[node]
     walk = [top]
-    # Iterative DFS: visit side branches first, the main-path child last.
-    stack = [(top, None, iter(_children(tree, top, None, on_main)))]
+    # Iterative DFS: side branches first, the main-path child last.
+    def children(node):
+        main = main_child.get(node)
+        kids = [j for j in adj[node] if j != parent[node] and j != main]
+        return iter(kids + [main] if main is not None else kids)
+    stack = [(top, children(top))]
     while stack:
-        node, parent, it = stack[-1]
+        node, it = stack[-1]
         child = next(it, None)
         if child is None:
             stack.pop()
-            if stack and node not in on_main:
+            if stack and main_child.get(stack[-1][0]) != node:
                 walk.append(stack[-1][0])     # come back up a side branch
             continue
         walk.append(child)
-        stack.append((child, node, iter(_children(tree, child, node, on_main))))
-    return walk
-
-
-def _children(tree, node, parent, on_main):
-    kids = [n for n in tree[node] if n != parent]
-    return sorted(kids, key=lambda n: n in on_main)   # main-path child last
+        stack.append((child, children(child)))
+    return [tuple(xy[i]) for i in walk]
 
 
 def to_stitches(walk_px, px_per_mm: float, stitch_mm: float, tolerance_mm: float = 0.15):
     """Pixel walk to design points in mm: start at (0, 0), Y down the picture,
     simplified and cut into stitches no longer than ``stitch_mm``."""
-    x0, y0 = walk_px[0]
-    pts = np.array([((x - x0) / px_per_mm, (y - y0) / px_per_mm) for x, y in walk_px])
+    walk = np.asarray(walk_px, dtype=float)
+    pts = (walk - walk[0]) / px_per_mm
     pts = measure.approximate_polygon(pts, tolerance=tolerance_mm)
     out = [(0.0, 0.0)]
     for a, b in zip(pts, pts[1:]):
@@ -148,11 +182,12 @@ def to_stitches(walk_px, px_per_mm: float, stitch_mm: float, tolerance_mm: float
 def draw_preview(points, path, scale=20, margin=10):
     xs = [p[0] for p in points]
     ys = [p[1] for p in points]
-    w = int((max(xs) - min(xs)) * scale) + 2 * margin
-    h = int((max(ys) - min(ys)) * scale) + 2 * margin
+    x0, y0 = min(xs), min(ys)
+    w = int((max(xs) - x0) * scale) + 2 * margin
+    h = int((max(ys) - y0) * scale) + 2 * margin
     img = Image.new("RGB", (max(w, 1), max(h, 1)), "white")
     d = ImageDraw.Draw(img)
-    xy = [((x - min(xs)) * scale + margin, (y - min(ys)) * scale + margin) for x, y in points]
+    xy = [((x - x0) * scale + margin, (y - y0) * scale + margin) for x, y in points]
     d.line(xy, fill=(30, 30, 30), width=2)
     for x, y in xy:
         d.ellipse((x - 2, y - 2, x + 2, y + 2), fill=(200, 40, 40))
@@ -169,9 +204,12 @@ def picture_to_design(img: Image.Image, length_mm: float, stitch_mm: float,
     if dropped:
         notes.append(f"kept the largest part of the drawing; {dropped} separate "
                      f"part(s) dropped (.sh7 has no trims)")
-    rows = np.nonzero(mask.any(axis=1))[0]
-    px_per_mm = (rows[-1] - rows[0] + 1) / length_mm
-    walk = sewing_walk(skeleton_tree(mask))
+    walk = sewing_walk(SkeletonTree(mask))
+    # Scale the sewn path itself (the skeleton, not the inked area) to length.
+    span = max(p[1] for p in walk) - min(p[1] for p in walk)
+    if span == 0:
+        raise sw.Sh7Error("the line has no length along the feed (picture height)")
+    px_per_mm = span / length_mm
     points = to_stitches(walk, px_per_mm, stitch_mm)
     width = max(p[0] for p in points) - min(p[0] for p in points)
     notes.append(f"{len(points) - 1} stitches, {width:.1f} x {length_mm:.1f} mm")

@@ -53,7 +53,6 @@ class Foot:
     id: str
     byte: int
     reach_half_mm: float
-    slot_half_mm: float = NEEDLE_SLOT_HALF_MM
 
 
 FEET = {
@@ -102,10 +101,6 @@ def _sign(x: float) -> int:
     return (x > 0) - (x < 0)
 
 
-def _trunc(x: float) -> int:
-    return int(x)
-
-
 # ---------------------------------------------------------------------------
 # Carriage planner (sh7pad ``carriagePlanner.ts``)
 #
@@ -123,15 +118,16 @@ class _Record:
 
 
 def _plan(foot: Foot, deltas: Sequence[Tuple[int, int]], uniform: bool,
-          cursor_x: int, carriage_x: int) -> List[List[_Record]]:
-    """Return one list of records per input (dx, dy) segment delta."""
-    slot_half = foot.slot_half_mm * X_UNITS_PER_MM
+          cursor_x: int, carriage_x: int, first_seg: int = 0) -> List[List[_Record]]:
+    """Return one list of records per input (dx, dy) segment delta.
+
+    ``first_seg`` is the design segment index of ``deltas[0]``, for messages."""
+    slot_half = NEEDLE_SLOT_HALF_MM * X_UNITS_PER_MM
     reach_half = foot.reach_half_mm * X_UNITS_PER_MM
-    max_needle_mm = 1.0 if uniform else math.inf
-    max_dx = max_needle_mm * X_UNITS_PER_MM
-    max_dy = max_needle_mm * Y_UNITS_PER_MM
-    piece_dx_cap = min(X_UNITS_PER_MM, max_dx)
-    piece_dy_cap = min(STITCH_DY_MAX_RAW, max_dy)
+    # Uniform mode caps every record at 1 mm in X and Y.
+    max_dx = X_UNITS_PER_MM if uniform else math.inf
+    piece_dx_cap = X_UNITS_PER_MM                  # firmware: 1 mm per jump
+    piece_dy_cap = Y_UNITS_PER_MM if uniform else STITCH_DY_MAX_RAW
     cursor_y = 0
     buckets: List[List[_Record]] = []
 
@@ -141,7 +137,7 @@ def _plan(foot: Foot, deltas: Sequence[Tuple[int, int]], uniform: bool,
 
     def refuse(seg_idx):
         raise Sh7Error(
-            f"segment {seg_idx} cannot be sewn with foot {foot.id}: the carriage "
+            f"segment {first_seg + seg_idx} cannot be sewn with foot {foot.id}: the carriage "
             f"would pass its reach of {foot.reach_half_mm} mm either side")
 
     for seg_idx, (seg_dx, seg_dy) in enumerate(deltas):
@@ -151,21 +147,20 @@ def _plan(foot: Foot, deltas: Sequence[Tuple[int, int]], uniform: bool,
 
         # Fast path: the whole segment is one needle swing.
         if (abs(target_x - carriage_x) <= slot_half + EPSILON
-                and abs(seg_dy) <= STITCH_DY_MAX_RAW
-                and abs(seg_dx) <= max_dx and abs(seg_dy) <= max_dy):
+                and abs(seg_dx) <= max_dx and abs(seg_dy) <= piece_dy_cap):
             cursor_x = target_x
             cursor_y += seg_dy
             push(bucket, "short", seg_dx, seg_dy)
             continue
 
-        if max_dx <= piece_dx_cap:
-            # Uniform mode: split evenly into <= 1 mm pieces.
+        if uniform:
+            # Split evenly into <= 1 mm pieces.
             n = max(1, math.ceil(abs(seg_dx) / piece_dx_cap),
                     math.ceil(abs(seg_dy) / piece_dy_cap))
             sx = _sign(seg_dx)
             step_x = sx * math.floor(abs(seg_dx) / n)
             x_rem = abs(seg_dx) - abs(step_x) * n
-            step_y = _trunc(seg_dy / n)
+            step_y = int(seg_dy / n)
             y_rem = seg_dy - step_y * n
             for _ in range(n):
                 extra_x = sx if x_rem > 0 else 0
@@ -235,14 +230,13 @@ def _plan(foot: Foot, deltas: Sequence[Tuple[int, int]], uniform: bool,
                 cursor_x += dx_piece
                 cursor_y += dy_piece
                 carriage_x = next_carriage
-                rem_dx -= dx_piece
                 rem_dy -= dy_piece
                 push(bucket, "jump", dx_piece, dy_piece)
 
         # Whatever Y is left goes in straight-down needle stitches.
         if abs(rem_dy) > EPSILON:
             n = max(1, math.ceil(abs(rem_dy) / piece_dy_cap))
-            step_y = _trunc(rem_dy / n)
+            step_y = int(rem_dy / n)
             y_rem = rem_dy - step_y * n
             for _ in range(n):
                 sy = _sign(y_rem)
@@ -328,17 +322,14 @@ def _o5_singleton(slot: int, tension_byte: int, x_um: int, y_um: int, x_elem: in
     return _chunk(b"\x05\x01\x02", bytes(payload))
 
 
-def _header(file_size: int) -> bytes:
-    producer = PRODUCER.encode("utf-16-be")
-    return (b"%spx%" + b"\x01\x02\x01" + _be32(file_size - 12)
-            + _be16(len(producer)) + producer)
-
-
 def _finalize(outer_prefix: bytes, o6: bytes, o5: bytes, geometry: bytes) -> bytes:
+    """Header plus the outer chunk.  The header's BE32 is the file size - 12."""
     payload = tpl.METADATA_TABLE + b"\x09" + o6 + b"\x09" + o5 + geometry
     outer = _chunk(outer_prefix, payload)
-    header_len = 14 + 2 * len(PRODUCER)
-    return _header(header_len + len(outer)) + outer
+    producer = PRODUCER.encode("utf-16-be")
+    header_len = 14 + len(producer)   # magic 5 + version 3 + size 4 + length 2
+    return (b"%spx%" + b"\x01\x02\x01" + _be32(header_len + len(outer) - 12)
+            + _be16(len(producer)) + producer + outer)
 
 
 def _singleton_file(foot_byte: int, tension_byte: int, x_um: int, y_um: int,
@@ -376,35 +367,9 @@ def _satin_payload(left: Sequence[Tuple[float, float]], right: Sequence[Tuple[fl
     return _be16(1) + edge(left) + edge(right) + _be16(0)
 
 
-def _multi_file(foot_byte: int, tension_byte: int, x_um: int, y_um: int, blocks) -> bytes:
-    o6 = _o6_block("multi", foot_byte, tension_byte, x_um, y_um)
-    o5 = b"".join(_o5_multi(s, tension_byte, x_um, y_um) for s in range(9))
-    parts, prev = [], None
-    for b in blocks:
-        if b["kind"] == "element":
-            parts.append(_be32(125) + _be32(125) + _be32(1000)
-                         + _be32(b["x_elem"]) + _be32(b["y_pos"]))
-            parts.append(_chunk(b"\x02\x01\x01",
-                                b"".join(_encode_record(*r) for r in b["records"])))
-        else:
-            if prev == "element":
-                parts.append(_be32(1) + _be32(1) + _be32(1)
-                             + _be32(b["interstitial"][0]) + _be32(b["interstitial"][1]))
-            parts.append(_chunk(b"\x02\x03\x01", _satin_payload(b["left"], b["right"])))
-        prev = b["kind"]
-    preamble = _be32(0) + _be16(len(blocks))
-    geometry = _chunk(b"\x01\x03\x03\x01", preamble + b"".join(parts))
-    return _finalize(b"\x07\x05\x01", o6, o5, geometry)
-
-
 # ---------------------------------------------------------------------------
 # Design to bytes (sh7pad ``encodeSegments.ts``, ``designSource.ts``,
 # ``multiBlockEmit.ts`` and ``satinShape.ts``)
-
-def _segment_kinds(design: Sh7Design) -> List[Union[str, Satin]]:
-    return list(design.segments) if design.segments is not None \
-        else ["straight"] * (len(design.points) - 1)
-
 
 def _cone(a: Tuple[float, float], b: Tuple[float, float], satin: Satin):
     """Left and right cone edges (top to bottom).  Left is the +perp side of
@@ -418,7 +383,9 @@ def _cone(a: Tuple[float, float], b: Tuple[float, float], satin: Satin):
     return left, right
 
 
-def _check_design(design: Sh7Design) -> Foot:
+def _check_design(design: Sh7Design) -> Tuple[Foot, List[Union[str, Satin]]]:
+    """Refuse designs outside the format envelope; return the foot and the
+    segment kinds (one per segment, "straight" or a Satin)."""
     if design.foot not in FEET:
         raise Sh7Error(f"unknown foot {design.foot!r}; use one of {sorted(FEET)}")
     foot = FEET[design.foot]
@@ -426,7 +393,8 @@ def _check_design(design: Sh7Design) -> Foot:
         raise Sh7Error("a design needs at least two points")
     if design.points[0][1] != 0:
         raise Sh7Error("points[0] is the Start Stitch and must have y = 0")
-    kinds = _segment_kinds(design)
+    kinds = list(design.segments) if design.segments is not None \
+        else ["straight"] * (len(design.points) - 1)
     if len(kinds) != len(design.points) - 1:
         raise Sh7Error("segments must have one entry per pair of points")
     for i, k in enumerate(kinds):
@@ -452,16 +420,16 @@ def _check_design(design: Sh7Design) -> Foot:
     if max(xs) - min(xs) > foot.reach_half_mm * 2:
         raise Sh7Error(f"design is {max(xs) - min(xs):.2f} mm wide; foot {foot.id} "
                        f"reaches {foot.reach_half_mm * 2} mm")
-    if abs(design.points[0][0] - design.start_x_mm) > foot.slot_half_mm + EPSILON:
+    if abs(design.points[0][0] - design.start_x_mm) > NEEDLE_SLOT_HALF_MM + EPSILON:
         raise Sh7Error("the Start Stitch must sit inside the needle slot around the "
                        "Carriage Start")
     if design.start_x_mm > 0:
         # xElem = -start_x * 1000 is written as an unsigned BE32.
         raise Sh7Error("start_x_mm must be 0 or negative")
-    return foot
+    return foot, kinds
 
 
-def _straight_records(design: Sh7Design, foot: Foot):
+def _straight_records(design: Sh7Design, foot: Foot) -> List[Tuple[str, int, int, float, float]]:
     """Records of a satin-free design: (kind, dx_raw, dy_raw, x_mm, y_mm)."""
     pts = [(float(x), float(y)) for x, y in design.points]
     start_stitch_x = pts[0][0]
@@ -496,114 +464,6 @@ def _spine_x_at_y(left, right, y: float) -> float:
     return (_interpolate_at_y(left, y)[0] + _interpolate_at_y(right, y)[0]) / 2
 
 
-def _satin_blocks(design: Sh7Design, foot: Foot):
-    """Block list of a satin-bearing design: element stitch runs between cones.
-
-    The machine sews each cone itself from its edges, so a cone contributes
-    no needle records; the chain enters at the cone's top-left corner and
-    leaves at its bottom-right (or the corner ``end_at`` asks for)."""
-    pts = [(float(x), float(y)) for x, y in design.points]
-    kinds = _segment_kinds(design)
-    cones = {i: _cone(pts[i], pts[i + 1], k) for i, k in enumerate(kinds) if isinstance(k, Satin)}
-
-    blocks, starts = [], []
-    cur: list = []
-    cur_start = None
-    chain = pts[0]
-    carriage = pts[0][0]
-
-    def flush():
-        nonlocal cur, cur_start
-        if cur:
-            blocks.append({"kind": "element", "records": cur})
-            starts.append(cur_start or chain)
-        cur, cur_start = [], None
-
-    def move_to(target, seg_idx):
-        nonlocal chain, carriage, cur_start
-        if cur_start is None:
-            cur_start = chain
-        dx = _js_round((target[0] - chain[0]) * X_UNITS_PER_MM)
-        dy = _js_round((target[1] - chain[1]) * Y_UNITS_PER_MM)
-        if dx == 0 and dy == 0:
-            chain = target
-            return 0
-        try:
-            [bucket] = _plan(foot, [(dx, dy)], design.uniform,
-                             cursor_x=_js_round(chain[0] * X_UNITS_PER_MM),
-                             carriage_x=_js_round(carriage * X_UNITS_PER_MM))
-        except Sh7Error:
-            raise Sh7Error(f"segment {seg_idx} cannot be sewn with foot {foot.id}: the "
-                           f"carriage would pass its reach of {foot.reach_half_mm} mm") from None
-        for r in bucket:
-            cur.append((r.kind, r.dx, r.dy))
-            carriage = r.carriage_x_mm
-        chain = target
-        return len(bucket)
-
-    for i, k in enumerate(kinds):
-        if not isinstance(k, Satin):
-            move_to(pts[i + 1], i)
-            continue
-        left, right = cones[i]
-        tl, br = left[0], right[-1]
-        if move_to(tl, i):
-            carriage = _spine_x_at_y(left, right, tl[1])
-        flush()
-        blocks.append({"kind": "satin", "left": left, "right": right})
-        starts.append(None)
-        chain = br
-        drops = _satin_drops(left, right, k.density)
-        prev = tl
-        for d in drops:
-            # sh7pad refuses a cone whose zigzag steps more than 4 mm in Y.
-            if abs(_js_round((d[1] - prev[1]) * Y_UNITS_PER_MM)) > STITCH_DY_MAX_RAW:
-                raise Sh7Error(f"segment {i}: the satin zigzag steps more than 4 mm "
-                               "along the stitch; make the cone narrower or less slanted")
-            prev = d
-        carriage = _spine_x_at_y(left, right, drops[-1][1])
-        trailer = None
-        if k.end_at == "left":
-            trailer = left[-1]
-        elif k.end_at == "center":
-            trailer = ((left[-1][0] + right[-1][0]) / 2, (left[-1][1] + right[-1][1]) / 2)
-        if trailer is not None:
-            if move_to(trailer, i):
-                carriage = _spine_x_at_y(left, right, trailer[1])
-    flush()
-    if blocks and blocks[-1]["kind"] == "satin":
-        blocks.append({"kind": "element", "records": [("short", 0, 0)]})
-        starts.append(chain)
-
-    # Offsets: element starts and cone positions relative to the design bbox.
-    bbox_pts = list(pts) + [p for left, right in cones.values() for p in left + right]
-    min_x = min(p[0] for p in bbox_pts)
-    min_y = min(p[1] for p in bbox_pts)
-    start_dx = _js_round(pts[0][0] * X_UNITS_PER_MM)
-    injected = pts[0][0] == 0
-    running_y = pts[0][1]
-    out = []
-    for b, start in zip(blocks, starts):
-        if b["kind"] == "element":
-            start = start or pts[0]
-            records = b["records"]
-            if not injected:
-                records = [("short", start_dx, 0)] + records
-                injected = True
-            out.append({"kind": "element", "records": records,
-                        "x_elem": _js_round((start[0] - min_x) * 1000),
-                        "y_pos": _js_round((start[1] - min_y) * 1500)})
-        else:
-            cone_min_x = min(p[0] for p in b["left"] + b["right"])
-            out.append({**b, "interstitial": (_js_round((cone_min_x - min_x) * 1000),
-                                              _js_round((running_y - min_y) * 1500))})
-            running_y = b["right"][-1][1]
-    max_x = max(p[0] for p in bbox_pts)
-    max_y = max(p[1] for p in bbox_pts)
-    size = (_js_round((max_x - min_x) * 1000), _js_round((max_y - min_y) * 1000))
-    return out, size
-
-
 def _satin_drops(left, right, density: float) -> List[Tuple[float, float]]:
     """The zigzag drops the machine sews inside a cone, as sh7pad's
     ``satinStitches`` computes them.  The step count is odd, so the last drop
@@ -619,37 +479,154 @@ def _satin_drops(left, right, density: float) -> List[Tuple[float, float]]:
     return drops
 
 
+@dataclass
+class _Element:
+    """A run of stitch records between cones, starting at ``start`` (mm)."""
+    records: List[Tuple[str, int, int]]
+    start: Tuple[float, float]
+
+
+@dataclass
+class _Cone:
+    left: List[Tuple[float, float]]
+    right: List[Tuple[float, float]]
+
+
+def _satin_blocks(design: Sh7Design, foot: Foot, kinds):
+    """Blocks of a satin-bearing design, plus every record's dy (raw) for the
+    per-record check, cone zigzag drops included.
+
+    The machine sews each cone itself from its edges, so a cone contributes
+    no stitch records; the chain enters at the cone's top-left corner and
+    leaves at its bottom-right (or the corner ``end_at`` asks for)."""
+    pts = [(float(x), float(y)) for x, y in design.points]
+    blocks: list = []
+    dys: List[int] = []
+    cur: List[Tuple[str, int, int]] = []
+    cur_start = None
+    chain = pts[0]
+    carriage = pts[0][0]
+
+    def flush():
+        nonlocal cur, cur_start
+        if cur:
+            blocks.append(_Element(cur, cur_start))
+        cur, cur_start = [], None
+
+    def move_to(target, seg_idx, cone=None):
+        """Plan the stitches from the chain to ``target``.  Inside a cone the
+        carriage then rides the cone's spine."""
+        nonlocal chain, carriage, cur_start
+        if cur_start is None:
+            cur_start = chain
+        dx = _js_round((target[0] - chain[0]) * X_UNITS_PER_MM)
+        dy = _js_round((target[1] - chain[1]) * Y_UNITS_PER_MM)
+        chain_x = chain[0]
+        chain = target
+        if dx == 0 and dy == 0:
+            return
+        [bucket] = _plan(foot, [(dx, dy)], design.uniform,
+                         cursor_x=_js_round(chain_x * X_UNITS_PER_MM),
+                         carriage_x=_js_round(carriage * X_UNITS_PER_MM), first_seg=seg_idx)
+        cur.extend((r.kind, r.dx, r.dy) for r in bucket)
+        dys.extend(r.dy for r in bucket)
+        carriage = _spine_x_at_y(*cone, target[1]) if cone else bucket[-1].carriage_x_mm
+
+    for i, k in enumerate(kinds):
+        if not isinstance(k, Satin):
+            move_to(pts[i + 1], i)
+            continue
+        left, right = _cone(pts[i], pts[i + 1], k)
+        move_to(left[0], i, (left, right))
+        flush()
+        blocks.append(_Cone(left, right))
+        chain = right[-1]
+        prev = left[0]
+        drops = _satin_drops(left, right, k.density)
+        for drop in drops:
+            dys.append(_js_round((drop[1] - prev[1]) * Y_UNITS_PER_MM))
+            prev = drop
+        carriage = _spine_x_at_y(left, right, drops[-1][1])
+        if k.end_at == "left":
+            move_to(left[-1], i, (left, right))
+        elif k.end_at == "center":
+            move_to(((left[-1][0] + right[-1][0]) / 2, (left[-1][1] + right[-1][1]) / 2),
+                    i, (left, right))
+    flush()
+    if isinstance(blocks[-1], _Cone):
+        blocks.append(_Element([("short", 0, 0)], chain))
+    # The Start Stitch goes first in the first element, unless it is at x = 0.
+    if pts[0][0] != 0:
+        first = next(b for b in blocks if isinstance(b, _Element))
+        first.records = [("short", _js_round(pts[0][0] * X_UNITS_PER_MM), 0)] + first.records
+    return blocks, dys
+
+
+def _multi_file(foot_byte: int, tension_byte: int, pts, blocks) -> bytes:
+    """Multi-element file.  Element starts and cone positions are written
+    relative to the design bbox (points and cone corners)."""
+    cones = [b for b in blocks if isinstance(b, _Cone)]
+    bbox = list(pts) + [p for c in cones for p in c.left + c.right]
+    min_x = min(p[0] for p in bbox)
+    min_y = min(p[1] for p in bbox)
+    x_um = _js_round((max(p[0] for p in bbox) - min_x) * 1000)
+    y_um = _js_round((max(p[1] for p in bbox) - min_y) * 1000)
+    o6 = _o6_block("multi", foot_byte, tension_byte, x_um, y_um)
+    o5 = b"".join(_o5_multi(s, tension_byte, x_um, y_um) for s in range(9))
+    parts, prev, running_y = [], None, pts[0][1]
+    for b in blocks:
+        if isinstance(b, _Element):
+            parts.append(_be32(125) + _be32(125) + _be32(1000)
+                         + _be32(_js_round((b.start[0] - min_x) * 1000))
+                         + _be32(_js_round((b.start[1] - min_y) * 1500)))
+            parts.append(_chunk(b"\x02\x01\x01",
+                                b"".join(_encode_record(*r) for r in b.records)))
+        else:
+            if isinstance(prev, _Element):
+                cone_min_x = min(p[0] for p in b.left + b.right)
+                parts.append(_be32(1) + _be32(1) + _be32(1)
+                             + _be32(_js_round((cone_min_x - min_x) * 1000))
+                             + _be32(_js_round((running_y - min_y) * 1500)))
+            parts.append(_chunk(b"\x02\x03\x01", _satin_payload(b.left, b.right)))
+            running_y = b.right[-1][1]
+        prev = b
+    preamble = _be32(0) + _be16(len(blocks))
+    geometry = _chunk(b"\x01\x03\x03\x01", preamble + b"".join(parts))
+    return _finalize(b"\x07\x05\x01", o6, o5, geometry)
+
+
+def _check_dys(dys: Sequence[int]) -> None:
+    """sh7pad's per-record envelope: at most 4 mm along the feed per record."""
+    for n, dy in enumerate(dys):
+        if abs(dy) > STITCH_DY_MAX_RAW:
+            raise Sh7Error(f"stitch {n} moves {dy / Y_UNITS_PER_MM:.2f} mm along the feed; "
+                           "the machine allows 4 mm per record (on a satin, make the cone "
+                           "narrower or less slanted)")
+
+
 def sew_records(design: Sh7Design) -> List[Tuple[str, int, int, float, float]]:
     """The machine records of a satin-free design: (kind, dx_raw, dy_raw, x_mm, y_mm).
 
     The first record is the Start Stitch.  ``x_mm`` and ``y_mm`` are where the
     needle lands after the record, in design coordinates.
     """
-    foot = _check_design(design)
-    if any(isinstance(k, Satin) for k in _segment_kinds(design)):
+    foot, kinds = _check_design(design)
+    if any(isinstance(k, Satin) for k in kinds):
         raise Sh7Error("sew_records covers straight segments only")
     return _straight_records(design, foot)
 
 
-def _check_records(records) -> None:
-    for n, (kind, _dx, dy, *_rest) in enumerate(records):
-        if abs(dy) > STITCH_DY_MAX_RAW:
-            raise Sh7Error(f"{kind} record {n} moves {dy / Y_UNITS_PER_MM:.2f} mm along the "
-                           "stitch; the machine allows 4 mm per record")
-
-
 def write_sh7(design: Sh7Design) -> bytes:
     """Encode a design as the bytes of a .sh7 file."""
-    foot = _check_design(design)
+    foot, kinds = _check_design(design)
     tension_byte = _js_round(design.tension * 10)
-    if any(isinstance(k, Satin) for k in _segment_kinds(design)):
-        blocks, (x_um, y_um) = _satin_blocks(design, foot)
-        for b in blocks:
-            if b["kind"] == "element":
-                _check_records(b["records"])
-        return _multi_file(foot.byte, tension_byte, x_um, y_um, blocks)
+    if any(isinstance(k, Satin) for k in kinds):
+        blocks, dys = _satin_blocks(design, foot, kinds)
+        _check_dys(dys)
+        pts = [(float(x), float(y)) for x, y in design.points]
+        return _multi_file(foot.byte, tension_byte, pts, blocks)
     records = _straight_records(design, foot)
-    _check_records(records)
+    _check_dys([r[2] for r in records])
     # The displayed size is the bbox of every needle position, as sh7pad
     # computes it for satin-free designs.
     xs = [r[3] for r in records]
