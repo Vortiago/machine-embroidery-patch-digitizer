@@ -146,6 +146,8 @@ tools/
     key_background.py  turn a flat background into transparency
     make_config.py   write a starter YAML config for a picture
     swatch.py        make a calibration swatch for a fabric
+    sh7_from_picture.py  line art to a .sh7 decorative stitch (Husqvarna Viking)
+    sh7_writer.py    .sh7 encoder, ported from sh7pad
     invert_ink.py    one-off tool that builds the inverted Scavenger's Daughter
     qa/              checks: fabric pull, coverage, travel, regression run
   wxstub/            stand-in for wx so Ink/Stitch runs without a GUI
