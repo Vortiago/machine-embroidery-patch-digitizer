@@ -1028,7 +1028,148 @@
     });
   }
 
+  /* ---- WebMCP: the same tools as tools/digitize/web/mcp_server.py, for a browser agent ----
+     The tool list is static/mcp_tools.json, shared with the stdio server. The page registers
+     them with the browser's model context (document.modelContext in the current WebMCP
+     draft, navigator.modelContext in earlier builds). Each tool runs the same doSlice,
+     doStitchplan or doCancel as the buttons, so the Region map and the Stitch plan draw on
+     screen while the agent works. Without WebMCP nothing here runs. */
+
+  var WEBMCP_SLICE_WAIT_MS = 120000;
+  var WEBMCP_PLAN_WAIT_MS = 60000;
+
+  /* Refresh until the job ends or maxMs passes; the page's own poller takes over after. */
+  function waitIdle(maxMs) {
+    stopPolling();
+    var end = Date.now() + maxMs;
+    function step() {
+      return refreshStatus().then(function (status) {
+        if (!isBusy() || Date.now() >= end) { startPolling(); return status; }
+        return new Promise(function (resolve) { setTimeout(resolve, POLL_MS); }).then(step);
+      });
+    }
+    return step();
+  }
+
+  /* An action ran through runAction, which keeps a failure in state.actionError. */
+  function thenWait(maxMs) {
+    return function () {
+      if (state.actionError) { throw new Error(state.actionError); }
+      return waitIdle(maxMs);
+    };
+  }
+
+  function toolReport(status) {
+    var out = { state: status.state, stage: status.stage, elapsed_s: status.elapsed_s,
+                error: status.error };
+    if (status.state === 'failed') { out.log_tail = status.log_tail; }
+    if (status.picture) {
+      out.picture = { width: status.picture.width, height: status.picture.height, url: status.picture.url };
+    }
+    if (status.stitchplan) {
+      var plan = status.stitchplan;
+      out.stitchplan = {
+        slice_id: plan.slice_id, stitches: plan.stitches, width_mm: plan.width_mm,
+        height_mm: plan.height_mm, threads: plan.threads, warnings: plan.warnings,
+        removed_by_precheck: plan.removed_by_precheck, vp3_url: plan.vp3_url,
+        stitchplan_url: plan.stitchplan_url, coverage_url: plan.coverage_url,
+        stale: !!status.slice && plan.slice_id !== status.slice.slice_id      /* E7 */
+      };
+    }
+    if (isBusy()) { out.note = 'Still running. Call status again later.'; }
+    if (!status.slice) { return Promise.resolve(out); }
+    var slice = status.slice;
+    out.slice = { slice_id: slice.slice_id, hoop: slice.hoop, svg_url: slice.svg_url };
+    var drawn = state.mapKey === slice.svg_url && state.reported;
+    return (drawn ? Promise.resolve(state.regions) : readRegions(slice)).then(function (regions) {
+      out.slice.overrides = (regions && Array.isArray(regions.overrides)) ? regions.overrides :
+        (slice.overrides || []).map(function (o) { return { at_px: o.at_px, type: o.type, status: 'pending' }; });
+      return out;
+    });
+  }
+
+  function setChecked(name, value) {
+    var input = document.querySelector('input[name="' + name + '"][value="' + value + '"]');
+    if (input) { input.checked = true; }
+    return !!input;
+  }
+
+  /* Tool arguments set the sidebar controls first, so the page shows what was sliced. */
+  function applySliceArgs(args) {
+    var hoops = (state.options && state.options.hoops) || [];
+    if (args.hoop) {
+      var index = hoops.findIndex(function (h) { return h[0] === args.hoop[0] && h[1] === args.hoop[1]; });
+      if (index < 0) { throw new Error('hoop must be one of ' + JSON.stringify(hoops) + '.'); }
+      setChecked('hoop', String(index));
+    }
+    if (args.colors !== undefined && !setChecked('color', String(args.colors))) {
+      throw new Error('colors must be 4, 6 or 8.');
+    }
+    if (args.size_mm !== undefined) {
+      $('in-fill-hoop').checked = args.size_mm === null;
+      if (args.size_mm !== null) { $('in-size').value = args.size_mm; }
+      $('in-fill-hoop').dispatchEvent(new Event('change'));
+    }
+    if (typeof args.key_background === 'boolean') { $('in-keybg').checked = args.key_background; }
+    if (Array.isArray(args.overrides)) {
+      state.overrides = normaliseOverrides(args.overrides);
+      afterOverrideChange();
+    }
+  }
+
+  function notBusy() {
+    if (isBusy()) { throw new Error('A job is already running. Call status, or cancel it first.'); }
+  }
+
+  var WEBMCP_RUN = {
+    slice: function (args) {
+      if (!state.status || !state.status.picture) {
+        throw new Error('No picture yet: the operator loads one in the page first.');
+      }
+      notBusy();
+      applySliceArgs(args || {});
+      return doSlice().then(thenWait(WEBMCP_SLICE_WAIT_MS)).then(toolReport);
+    },
+    make_stitch_plan: function (args) {
+      notBusy();
+      var wait = (args && typeof args.wait_s === 'number') ? args.wait_s * 1000 : WEBMCP_PLAN_WAIT_MS;
+      switchTab('stitchplan');
+      return doStitchplan().then(thenWait(wait)).then(toolReport);
+    },
+    status: function () { return refreshStatus().then(toolReport); },
+    cancel: function () {
+      return doCancel().then(function () {
+        if (state.actionError) { throw new Error(state.actionError); }
+        return { cancelled: runState() === 'cancelled' };
+      });
+    }
+  };
+
+  function execute(name) {
+    return function (args) {
+      return Promise.resolve().then(function () { return WEBMCP_RUN[name](args); }).then(function (value) {
+        return { content: [{ type: 'text', text: JSON.stringify(value, null, 1) }] };
+      }, function (err) {
+        return { content: [{ type: 'text', text: err.message }], isError: true };
+      });
+    };
+  }
+
+  function registerWebMcp() {
+    var context = document.modelContext || navigator.modelContext;
+    if (!context || typeof context.registerTool !== 'function') { return; }
+    api('/static/mcp_tools.json').then(function (tools) {
+      tools.forEach(function (tool) {
+        tool.execute = execute(tool.name);
+        Promise.resolve().then(function () { return context.registerTool(tool); }).catch(function (err) {
+          console.warn('WebMCP: ' + tool.name + ' not registered: ' + err.message);
+        });
+      });
+    }).catch(function (err) { console.warn('WebMCP: no tool list: ' + err.message); });
+  }
+
   wire();
+  registerWebMcp();
   loadOptions().catch(function (err) { showError(err.message); });
   afterAction().catch(function (err) { showError(err.message); });
 }());

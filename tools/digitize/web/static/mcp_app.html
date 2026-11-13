@@ -1,0 +1,300 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Digitize Patches</title>
+<!-- MCP App view (docs/design/mcp.md, M7 to M9). The chat client shows this file in a
+     sandboxed frame next to a slice, make_stitch_plan or status result. It loads nothing
+     from the network: the Region map SVG and the pictures arrive in the tool result, and
+     the buttons call the server's tools through the client (tools/call). -->
+<style>
+  :root { --bg: #ffffff; --fg: #1d1d1f; --muted: #6b6b70; --line: #d9d9de; --accent: #1f6feb;
+          --satin: #d1242f; --fill: #1a7f37; --map: #f4f4f6; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1c1c1e; --fg: #ececf0; --muted: #a0a0a8; --line: #3a3a40; --accent: #58a6ff;
+            --satin: #ff7b72; --fill: #3fb950; --map: #2a2a2e; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 12px; background: var(--bg); color: var(--fg);
+         font: 14px/1.4 system-ui, sans-serif; }
+  h2 { font-size: 15px; margin: 0 0 8px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 8px 0; }
+  .muted { color: var(--muted); }
+  button { font: inherit; padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px;
+           background: var(--bg); color: var(--fg); cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; cursor: default; }
+  .map { background: var(--map); border-radius: 6px; padding: 6px; }
+  .map svg { display: block; width: 100%; height: auto; max-height: 70vh; }
+  .map path.locked { opacity: .55; }
+  .map path.clickable { cursor: pointer; }
+  .map path.clickable:hover { filter: brightness(1.2); }
+  .map circle.mark { stroke: #fff; stroke-width: 1.5; vector-effect: non-scaling-stroke; pointer-events: none; }
+  ul { margin: 4px 0; padding-left: 18px; }
+  .st-applied { color: var(--fill); } .st-refused, .st-orphaned { color: var(--satin); }
+  .plan img { max-width: 100%; border-radius: 6px; display: block; }
+  table { border-collapse: collapse; } td { padding: 1px 10px 1px 0; vertical-align: top; }
+  #pop { position: fixed; display: none; gap: 4px; padding: 6px; background: var(--bg);
+         border: 1px solid var(--line); border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,.2); }
+  #error { color: var(--satin); }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div id="msg" class="muted">Waiting for the tool result.</div>
+<div id="error" class="hidden"></div>
+<section id="slice" class="hidden">
+  <h2>Region map</h2>
+  <div class="muted">Click a fill or satin Region to set its stitch type, then slice again.</div>
+  <div id="map" class="map"></div>
+  <ul id="overrides"></ul>
+  <div class="row">
+    <button id="btn-slice" class="primary">Slice again</button>
+    <button id="btn-plan">Make stitch plan</button>
+    <button id="btn-status">Refresh</button>
+    <span id="busy" class="muted"></span>
+  </div>
+</section>
+<section id="plan" class="plan hidden">
+  <h2>Stitch plan <span id="stale" class="muted"></span></h2>
+  <table id="facts"></table>
+  <ul id="warnings"></ul>
+  <div id="planimg"></div>
+</section>
+<div id="pop"><button data-type="satin">Satin</button><button data-type="fill">Fill</button><button data-type="">Clear</button></div>
+<script>
+(function () {
+  'use strict';
+  var LOCKED = { outline: 1, border: 1, gradient: 1, run: 1 };
+  var INKSTITCH_NS = 'http://inkstitch.org/namespace';
+  var nextId = 1, pending = {}, state = { overrides: [], svg: null, busy: false, at: null, path: null };
+
+  function $(id) { return document.getElementById(id); }
+  function show(el, on) { el.classList.toggle('hidden', !on); }
+  function make(tag, cls, text) {
+    var n = document.createElement(tag);
+    if (cls) { n.className = cls; }
+    if (text !== undefined) { n.textContent = text; }
+    return n;
+  }
+
+  /* ---- JSON-RPC to the chat client over postMessage ---- */
+
+  function send(msg) { window.parent.postMessage(msg, '*'); }
+  function request(method, params) {
+    var id = nextId++;
+    send({ jsonrpc: '2.0', id: id, method: method, params: params || {} });
+    return new Promise(function (resolve, reject) { pending[id] = { resolve: resolve, reject: reject }; });
+  }
+  function notify(method, params) { send({ jsonrpc: '2.0', method: method, params: params || {} }); }
+
+  window.addEventListener('message', function (event) {
+    var msg = event.data;
+    if (!msg || msg.jsonrpc !== '2.0') { return; }
+    if (msg.id !== undefined && pending[msg.id] && !msg.method) {
+      var p = pending[msg.id]; delete pending[msg.id];
+      if (msg.error) { p.reject(new Error(msg.error.message || 'request failed')); } else { p.resolve(msg.result); }
+      return;
+    }
+    if (msg.method === 'ui/notifications/tool-result') { render(msg.params || {}); }
+    if (msg.id !== undefined && msg.method) {                 /* a host request we do not serve */
+      send({ jsonrpc: '2.0', id: msg.id, result: {} });
+    }
+  });
+
+  function resized() {
+    notify('ui/notifications/size-changed', { width: document.documentElement.scrollWidth,
+                                               height: document.documentElement.scrollHeight });
+  }
+
+  /* ---- drawing a tool result ---- */
+
+  function render(result) {
+    var view = result._meta && result._meta['digitize/view'];
+    var text = (result.content || []).filter(function (c) { return c.type === 'text'; })
+      .map(function (c) { return c.text; }).join('\n');
+    var report = null;
+    try { report = JSON.parse(text); } catch (err) { report = null; }
+    if (result.isError || !report) {
+      showError(text || 'The tool failed.');
+      return;
+    }
+    showError('');
+    state.busy = report.state === 'slicing' || report.state === 'exporting';
+    $('msg').textContent = 'State: ' + report.state + (report.stage ? ', ' + report.stage : '') +
+      (report.elapsed_s !== null && report.elapsed_s !== undefined ? ' (' + report.elapsed_s + ' s)' : '') +
+      (report.error ? '. ' + report.error : '');
+    $('busy').textContent = state.busy ? 'Still running: press Refresh.' : '';
+    if (report.slice) {
+      show($('slice'), true);
+      state.overrides = report.slice.overrides || [];
+      if (view && view.svg) { mountMap(view.svg, view.kinds || null); }
+      else if (!state.svg) { $('map').textContent = 'The Region map is too large to show here: ' + report.slice.svg; }
+      renderOverrides();
+    }
+    if (report.stitchplan) { renderPlan(report.stitchplan, result.content || [], view); }
+    setBusy(state.busy);
+    resized();
+  }
+
+  function setBusy(on) {
+    state.busy = on;
+    ['btn-slice', 'btn-plan'].forEach(function (id) { $(id).disabled = on; });
+  }
+
+  function showError(text) { $('error').textContent = text; show($('error'), !!text); resized(); }
+
+  function mountMap(svgText, kinds) {
+    var doc = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+    if (doc.getElementsByTagName('parsererror').length) { $('map').textContent = 'The Region map did not parse.'; return; }
+    var svg = document.importNode(doc.documentElement, true);
+    svg.removeAttribute('width'); svg.removeAttribute('height');
+    Array.prototype.forEach.call(svg.querySelectorAll('script, foreignObject'), function (n) { n.remove(); });
+    Array.prototype.forEach.call(svg.querySelectorAll('path'), function (path) {
+      var kind = (kinds && kinds[path.id]) || kindFromSvg(path);
+      path.setAttribute('data-kind', kind);
+      path.classList.add(LOCKED[kind] ? 'locked' : 'clickable');
+    });
+    var marks = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+    marks.setAttribute('class', 'marks');
+    svg.appendChild(marks);
+    $('map').textContent = '';
+    $('map').appendChild(svg);
+    svg.addEventListener('click', onMapClick);
+    state.svg = svg;
+  }
+
+  function kindFromSvg(path) {
+    var p = path.parentNode, group = '';
+    while (p && p.nodeType === 1) { if (p.id) { group = p.id; break; } p = p.parentNode; }
+    if (group === 'border') { return 'border'; }
+    if (group === 'outlines') { return 'outline'; }
+    if (/fill\s*:\s*url\(/.test(path.getAttribute('style') || '')) { return 'gradient'; }
+    /* the page's rule (app.js kindFromSvg): a satin column inside a colour group */
+    if ((path.hasAttributeNS(INKSTITCH_NS, 'satin_column') ||
+        path.getAttribute('inkstitch:satin_column') !== null) && /^color\d+$/.test(group)) {
+      return 'satinized';
+    }
+    if (/^r\d/.test(path.id || '')) { return 'run'; }
+    return 'fill';
+  }
+
+  function renderOverrides() {
+    var list = $('overrides');
+    list.textContent = '';
+    if (!state.overrides.length) { list.appendChild(make('li', 'muted', 'No stitch type overrides.')); }
+    state.overrides.forEach(function (o) {
+      var st = o.status || 'not sliced yet';
+      list.appendChild(make('li', 'st-' + st, o.type + ' at ' + o.at_px.join(', ') + ' px: ' + st +
+        (o.reason ? ' (' + o.reason + ')' : '')));
+    });
+    if (!state.svg) { return; }
+    var marks = state.svg.querySelector('g.marks');
+    marks.textContent = '';
+    var box = (state.svg.getAttribute('viewBox') || '0 0 1000 1000').split(/[\s,]+/).map(Number);
+    state.overrides.forEach(function (o) {
+      var c = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+      c.setAttribute('cx', o.at_px[0]); c.setAttribute('cy', o.at_px[1]);
+      c.setAttribute('r', Math.max(box[2], box[3]) / 80);
+      c.setAttribute('class', 'mark');
+      c.setAttribute('fill', o.type === 'satin' ? 'var(--satin)' : 'var(--fill)');
+      marks.appendChild(c);
+    });
+  }
+
+  function hit(path, at) {
+    var pt = new DOMPoint(at[0], at[1]);
+    try { if (path.isPointInFill(pt)) { return true; } } catch (err) { /* no fill geometry */ }
+    try { return path.isPointInStroke(pt); } catch (err) { return false; }
+  }
+
+  function onMapClick(event) {
+    var path = event.target.closest ? event.target.closest('path.clickable') : null;
+    if (!path) { hidePop(); return; }
+    var m = state.svg.getScreenCTM();
+    if (!m) { return; }
+    var pt = new DOMPoint(event.clientX, event.clientY).matrixTransform(m.inverse());
+    state.at = [Math.round(pt.x), Math.round(pt.y)];
+    state.path = path;
+    var pop = $('pop');
+    pop.style.display = 'flex';
+    pop.style.left = Math.min(event.clientX, window.innerWidth - 180) + 'px';
+    pop.style.top = (event.clientY + 8) + 'px';
+    event.stopPropagation();
+  }
+
+  function hidePop() { $('pop').style.display = 'none'; }
+
+  Array.prototype.forEach.call($('pop').querySelectorAll('button'), function (b) {
+    b.addEventListener('click', function (event) {
+      event.stopPropagation();
+      var type = b.getAttribute('data-type');
+      /* E1: one override per Region. */
+      state.overrides = state.overrides.filter(function (o) { return !hit(state.path, o.at_px); });
+      if (type) { state.overrides.push({ at_px: state.at, type: type }); }
+      hidePop();
+      renderOverrides();
+      resized();
+    });
+  });
+  document.addEventListener('click', hidePop);
+
+  function renderPlan(plan, content, view) {
+    show($('plan'), true);
+    $('stale').textContent = plan.stale ? '(from an earlier Slice)' : '';
+    var facts = $('facts');
+    facts.textContent = '';
+    [['Stitches', plan.stitches], ['Size', plan.width_mm + ' x ' + plan.height_mm + ' mm'],
+     ['Threads', (plan.threads || []).join(', ')], ['VP3', plan.vp3]].forEach(function (r) {
+      var tr = make('tr'); tr.appendChild(make('td', 'muted', r[0])); tr.appendChild(make('td', null, String(r[1])));
+      facts.appendChild(tr);
+    });
+    var warnings = $('warnings');
+    warnings.textContent = '';
+    (plan.warnings || []).forEach(function (w) { warnings.appendChild(make('li', null, w)); });
+    (plan.removed_by_precheck || []).forEach(function (id) {
+      warnings.appendChild(make('li', null, 'Removed by the satin precheck: ' + id));
+    });
+    var img = (content || []).filter(function (c) { return c.type === 'image'; })[0];
+    if (view && view.plan_image && img) {
+      var el = make('img');
+      el.alt = 'Stitch plan';
+      el.src = 'data:' + img.mimeType + ';base64,' + img.data;
+      el.addEventListener('load', resized);
+      $('planimg').textContent = '';
+      $('planimg').appendChild(el);
+    }
+  }
+
+  /* ---- buttons: the server's own tools, through the chat client ---- */
+
+  function callTool(name, args) {
+    setBusy(true);
+    $('busy').textContent = 'Working...';
+    return request('tools/call', { name: name, arguments: args || {} }).then(render, function (err) {
+      setBusy(false);
+      $('busy').textContent = '';
+      showError(err.message);
+    });
+  }
+
+  $('btn-slice').addEventListener('click', function () {
+    callTool('slice', { overrides: state.overrides.map(function (o) { return { at_px: o.at_px, type: o.type }; }) });
+  });
+  $('btn-plan').addEventListener('click', function () { callTool('make_stitch_plan', { wait_s: 50 }); });
+  $('btn-status').addEventListener('click', function () { callTool('status', {}); });
+
+  request('ui/initialize', {
+    protocolVersion: '2026-01-26',
+    appInfo: { name: 'digitize-patches-view', version: '0.1.0' },
+    clientInfo: { name: 'digitize-patches-view', version: '0.1.0' },
+    appCapabilities: {}, capabilities: {}
+  }).then(function () {
+    notify('ui/notifications/initialized', {});
+    resized();
+  }, function (err) { showError('The chat client did not start this view: ' + err.message); });
+}());
+</script>
+</body>
+</html>
