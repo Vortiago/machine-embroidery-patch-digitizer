@@ -1,0 +1,471 @@
+[
+ {
+  "name": "zigzag_in_slot",
+  "foot": "S",
+  "tension": 4.0,
+  "points": [
+   [
+    0,
+    0
+   ],
+   [
+    2,
+    1
+   ],
+   [
+    -2,
+    2
+   ],
+   [
+    2,
+    3
+   ],
+   [
+    -2,
+    4
+   ],
+   [
+    0,
+    5
+   ]
+  ],
+  "segments": [
+   "straight",
+   "straight",
+   "straight",
+   "straight",
+   "straight"
+  ]
+ },
+ {
+  "name": "wide_traverse",
+  "foot": "S",
+  "tension": 4.0,
+  "points": [
+   [
+    0,
+    0
+   ],
+   [
+    20,
+    2
+   ],
+   [
+    20,
+    6
+   ],
+   [
+    -15,
+    9
+   ],
+   [
+    0,
+    12
+   ]
+  ],
+  "segments": [
+   "straight",
+   "straight",
+   "straight",
+   "straight"
+  ]
+ },
+ {
+  "name": "foot_b_wave",
+  "foot": "B",
+  "tension": 5.0,
+  "points": [
+   [
+    0,
+    0
+   ],
+   [
+    2,
+    1.5
+   ],
+   [
+    4,
+    3
+   ],
+   [
+    2,
+    4.5
+   ],
+   [
+    0,
+    6
+   ],
+   [
+    -2,
+    7.5
+   ],
+   [
+    -4,
+    9
+   ],
+   [
+    -2,
+    10.5
+   ],
+   [
+    0,
+    12
+   ]
+  ],
+  "segments": [
+   "straight",
+   "straight",
+   "straight",
+   "straight",
+   "straight",
+   "straight",
+   "straight",
+   "straight"
+  ]
+ },
+ {
+  "name": "uniform_mode",
+  "foot": "S",
+  "tension": 4.0,
+  "encoder_mode": "uniform",
+  "points": [
+   [
+    0,
+    0
+   ],
+   [
+    6,
+    3
+   ],
+   [
+    -6,
+    8
+   ],
+   [
+    0,
+    10
+   ]
+  ],
+  "segments": [
+   "straight",
+   "straight",
+   "straight"
+  ]
+ },
+ {
+  "name": "offset_start",
+  "foot": "S",
+  "tension": 4.0,
+  "start_x_mm": -1.5,
+  "start_stitch_x_mm": -1.0,
+  "points": [
+   [
+    -1,
+    0
+   ],
+   [
+    3,
+    2
+   ],
+   [
+    -5,
+    4
+   ],
+   [
+    1,
+    7
+   ]
+  ],
+  "segments": [
+   "straight",
+   "straight",
+   "straight"
+  ]
+ },
+ {
+  "name": "tall_vertical",
+  "foot": "hidden",
+  "tension": 3.5,
+  "points": [
+   [
+    0,
+    0
+   ],
+   [
+    0,
+    15
+   ],
+   [
+    1.25,
+    15
+   ],
+   [
+    1.25,
+    0.5
+   ],
+   [
+    0.333,
+    30
+   ]
+  ],
+  "segments": [
+   "straight",
+   "straight",
+   "straight",
+   "straight"
+  ]
+ },
+ {
+  "name": "rounding_halves",
+  "foot": "S",
+  "tension": 4.0,
+  "points": [
+   [
+    0,
+    0
+   ],
+   [
+    0.0625,
+    0.0416666
+   ],
+   [
+    -0.1875,
+    0.125
+   ],
+   [
+    0.3125,
+    0.2083333
+   ],
+   [
+    10.0625,
+    0.375
+   ]
+  ],
+  "segments": [
+   "straight",
+   "straight",
+   "straight",
+   "straight"
+  ]
+ },
+ {
+  "name": "satin_single",
+  "foot": "S",
+  "tension": 4.0,
+  "points": [
+   [
+    0,
+    0
+   ],
+   [
+    0,
+    1
+   ],
+   [
+    0,
+    11
+   ],
+   [
+    0,
+    12
+   ]
+  ],
+  "segments": [
+   "straight",
+   {
+    "type": "satin",
+    "widthStart": 4,
+    "widthEnd": 4,
+    "density": 0.4
+   },
+   "straight"
+  ]
+ },
+ {
+  "name": "satin_starts_design",
+  "foot": "S",
+  "tension": 4.0,
+  "points": [
+   [
+    0,
+    0
+   ],
+   [
+    0,
+    8
+   ]
+  ],
+  "segments": [
+   {
+    "type": "satin",
+    "widthStart": 3,
+    "widthEnd": 6,
+    "density": 0.35
+   }
+  ]
+ },
+ {
+  "name": "satin_cone_chain",
+  "foot": "S",
+  "tension": 4.2,
+  "points": [
+   [
+    0,
+    0
+   ],
+   [
+    1,
+    2
+   ],
+   [
+    1,
+    9
+   ],
+   [
+    6,
+    10
+   ],
+   [
+    6,
+    18
+   ],
+   [
+    0,
+    20
+   ]
+  ],
+  "segments": [
+   "straight",
+   {
+    "type": "satin",
+    "widthStart": 2,
+    "widthEnd": 6,
+    "density": 0.4,
+    "endAt": "left"
+   },
+   "straight",
+   {
+    "type": "satin",
+    "widthStart": 6,
+    "widthEnd": 1,
+    "density": 0.5,
+    "endAt": "center"
+   },
+   "straight"
+  ]
+ },
+ {
+  "name": "satin_offset_start",
+  "foot": "S",
+  "tension": 4.0,
+  "start_x_mm": -1.0,
+  "start_stitch_x_mm": -0.5,
+  "points": [
+   [
+    -0.5,
+    0
+   ],
+   [
+    2,
+    3
+   ],
+   [
+    2,
+    10
+   ],
+   [
+    -3,
+    14
+   ]
+  ],
+  "segments": [
+   "straight",
+   {
+    "type": "satin",
+    "widthStart": 5,
+    "widthEnd": 5,
+    "density": 0.3
+   },
+   "straight"
+  ]
+ },
+ {
+  "name": "satin_slanted_footb",
+  "foot": "B",
+  "tension": 3.8,
+  "points": [
+   [
+    0,
+    0
+   ],
+   [
+    0,
+    1
+   ],
+   [
+    2,
+    9
+   ],
+   [
+    -2,
+    12
+   ]
+  ],
+  "segments": [
+   "straight",
+   {
+    "type": "satin",
+    "widthStart": 3.5,
+    "widthEnd": 2,
+    "density": 0.45,
+    "endAt": "right"
+   },
+   "straight"
+  ]
+ },
+ {
+  "name": "satin_uniform",
+  "foot": "S",
+  "tension": 4.0,
+  "encoder_mode": "uniform",
+  "points": [
+   [
+    0,
+    0
+   ],
+   [
+    5,
+    4
+   ],
+   [
+    5,
+    12
+   ],
+   [
+    -5,
+    16
+   ],
+   [
+    -5,
+    24
+   ]
+  ],
+  "segments": [
+   "straight",
+   {
+    "type": "satin",
+    "widthStart": 4,
+    "widthEnd": 4,
+    "density": 0.4
+   },
+   "straight",
+   {
+    "type": "satin",
+    "widthStart": 4,
+    "widthEnd": 2,
+    "density": 0.4,
+    "endAt": "center"
+   }
+  ]
+ }
+]
