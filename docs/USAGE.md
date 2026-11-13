@@ -90,6 +90,24 @@ tools/digitize/run.sh --density 0.35 --colors 8 path/to/image.webp
 
 Output lands in `work/` alongside the repo.
 
+### From an AI client (MCP)
+
+```bash
+python3 digitize.py mcp              # MCP server on stdin/stdout
+python3 digitize.py mcp --port 8765  # the same, and the web page shows each run
+```
+
+Tools: `slice` (picture path, hoop, size, colours, YAML config, stitch type overrides),
+`make_stitch_plan`, `status`, `cancel`. A client config entry looks like:
+
+```json
+{"mcpServers": {"digitize": {"command": "python3",
+                             "args": ["/path/to/repo/digitize.py", "mcp", "--port", "8765"]}}}
+```
+
+The web page (`python3 digitize.py web`) registers the same tools with WebMCP when the
+browser supports it. Details: `docs/design/mcp.md`.
+
 ---
 
 ## Setup (one-time)

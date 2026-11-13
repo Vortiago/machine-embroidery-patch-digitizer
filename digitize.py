@@ -4,6 +4,7 @@
     python3 digitize.py setup     one-time install (needs uv)
     python3 digitize.py doctor    check that everything is ready
     python3 digitize.py web       start the local web page (127.0.0.1, --port N)
+    python3 digitize.py mcp       MCP server on stdio for AI clients (--port N adds the page)
     python3 digitize.py           start the guided wizard
 
 Standard library only, Python 3.9 or newer, so it starts on the system Python
@@ -63,6 +64,9 @@ def run(argv, root: Path = ROOT) -> int:
     if argv[:1] == ["web"]:
         from tools.digitize.web.server import main as web_main
         return int(web_main(list(argv[1:])) or 0)
+    if argv[:1] == ["mcp"]:
+        from tools.digitize.web.mcp_server import main as mcp_main
+        return int(mcp_main(list(argv[1:])) or 0)
     try:
         from tools.digitize.wizard import main as wizard_main
     except ImportError as exc:
