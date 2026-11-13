@@ -339,6 +339,33 @@ travel:              # travel_vp3.py: same-colour trims become runs under later 
 
 ---
 
+## Decorative stitches (`.sh7`, `tools/digitize/sh7_from_picture.py`)
+
+Husqvarna Viking machines load `.sh7` files as decorative stitches: one thread,
+sewn by the needle swing and a sideways-sliding carriage while the fabric
+feeds, not in a hoop. `sh7_from_picture.py` turns single-colour line art into
+one as a running stitch. The picture's top-to-bottom becomes the feed
+direction.
+
+```bash
+tools/digitize/sh7_from_picture.py input/wave.png output/wave.sh7 \
+    --length-mm 25 --stitch-mm 1.5 --foot S --preview output/wave_preview.png
+```
+
+- The line is the dark pixels of an opaque picture or the opaque pixels of a
+  transparent one (`--threshold` sets "dark").
+- `.sh7` has no trims, so only the largest connected part of the drawing is
+  kept. The walk runs from the drawing's top to its bottom; side branches are
+  sewn out and back.
+- Limits, refused with a message: 43.6 mm long; 54.5 mm wide with Foot S,
+  9 mm with Foot B; at most 4 mm along the feed per stitch.
+
+`sh7_writer.py` is the encoder. It also writes satin cones (`Satin` segments)
+from Python; the picture script does not make them yet. It is a port of
+[sh7pad](https://github.com/Vortiago/sh7pad) (MIT), whose `FORMAT.md`
+describes the reverse-engineered format, and its tests compare the output byte
+for byte with files sh7pad exports. Test a new file on scrap fabric first.
+
 ## Tunable constants
 
 These live at the top of `tools/digitize/vectorize.py` and are not CLI flags
