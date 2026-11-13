@@ -76,6 +76,35 @@ class Protocol(McpTestCase):
         self.assertEqual(lines[1]["error"]["code"], -32700)
 
 
+class AppView(McpTestCase):
+    def test_tools_name_the_view(self):
+        tools = {t["name"]: t for t in self.request("tools/list")["result"]["tools"]}
+        for name in ("slice", "make_stitch_plan", "status"):
+            self.assertEqual(tools[name]["_meta"]["ui"]["resourceUri"], mcp_server.VIEW_URI)
+        self.assertNotIn("_meta", tools["cancel"])
+
+    def test_resources(self):
+        listed = self.request("resources/list")["result"]["resources"]
+        self.assertEqual([r["uri"] for r in listed], [mcp_server.VIEW_URI])
+        read = self.request("resources/read", {"uri": mcp_server.VIEW_URI})["result"]["contents"][0]
+        self.assertEqual(read["mimeType"], "text/html;profile=mcp-app")
+        self.assertIn("ui/initialize", read["text"])
+        self.assertNotIn("src=\"http", read["text"])               # nothing from the network
+        self.assertEqual(self.request("resources/read", {"uri": "ui://x"})["error"]["code"], -32002)
+
+    def test_slice_result_carries_the_region_map(self):
+        self.set_mode("sidecar")
+        reply = self.request("tools/call", {"name": "slice",
+                                            "arguments": {"picture": str(self.picture)}})
+        view = reply["result"]["_meta"]["digitize/view"]
+        self.assertIn('<path id="f0"', view["svg"])
+        self.assertEqual(view["kinds"], {"f0": "fill"})
+        self.assertEqual(view["images"], ["posterized"])
+        with self.measured():
+            reply = self.request("tools/call", {"name": "make_stitch_plan", "arguments": {}})
+        self.assertEqual(reply["result"]["_meta"]["digitize/view"]["images"], ["stitchplan"])
+
+
 class SliceTool(McpTestCase):
     def test_needs_a_picture(self):
         result, message = self.call("slice")

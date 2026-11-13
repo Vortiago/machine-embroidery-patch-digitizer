@@ -105,8 +105,10 @@ Tools: `slice` (picture path, hoop, size, colours, YAML config, stitch type over
                              "args": ["/path/to/repo/digitize.py", "mcp", "--port", "8765"]}}}
 ```
 
-The web page (`python3 digitize.py web`) registers the same tools with WebMCP when the
-browser supports it. Details: `docs/design/mcp.md`.
+In clients that support MCP Apps, the results draw as a Region map and Stitch plan in the
+chat: click a Region to set Satin or Fill, then **Slice again**. The web page
+(`python3 digitize.py web`) registers the same tools with WebMCP when the browser supports
+it. Details: `docs/design/mcp.md`.
 
 ---
 

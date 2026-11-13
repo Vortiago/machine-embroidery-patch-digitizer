@@ -1,5 +1,8 @@
 """MCP server over stdio: the web UI's Slice and Stitch plan as tools for an AI client.
 
+slice, make_stitch_plan and status also name an MCP App view (static/mcp_app.html), so a
+client that supports MCP Apps draws the Region map and the Stitch plan in the chat.
+
     python3 digitize.py mcp              tools only, on stdin/stdout
     python3 digitize.py mcp --port 8765  also serve the page, so the browser shows each run
 
@@ -7,10 +10,11 @@ The tools drive the same Flask app as the page (server.create_app), in process t
 its test client, so a tool call and a button press run the same job code, the same checks
 and the same one-job-at-a-time lock. Nothing here starts a pipeline step on its own.
 
-The protocol is the small part of MCP the tools need (initialize, tools/list, tools/call,
-ping), as newline-delimited JSON-RPC 2.0 on stdin/stdout, written with the standard library
-so the tool keeps its no-new-dependency rule (docs/design/webui.md D8). stdout carries only
-protocol messages; everything else goes to stderr.
+The protocol is the small part of MCP the tools need (initialize, ping, tools/list,
+tools/call, and resources/list and resources/read for the view), as newline-delimited
+JSON-RPC 2.0 on stdin/stdout, written with the standard library so the tool keeps its
+no-new-dependency rule (docs/design/webui.md D8). stdout carries only protocol messages;
+everything else goes to stderr.
 """
 from __future__ import annotations
 
@@ -30,6 +34,11 @@ SERVER_INFO = {"name": "digitize-patches", "version": "0.1.0"}
 POLL_S = 0.25
 SLICE_WAIT_S = 120             # a Slice takes 3 to 5 s on a patch-sized picture
 PLAN_WAIT_S = 60               # an export takes 24 s to 85 min cold; status picks up the rest
+VIEW_URI = "ui://digitize/view.html"
+VIEW_MIME = "text/html;profile=mcp-app"
+VIEW_FILE = Path(__file__).resolve().parent / "static" / "mcp_app.html"
+VIEW_SVG_MAX = 2_000_000       # bytes of Region map SVG sent to the view; larger is left out
+UI_META = {"ui": {"resourceUri": VIEW_URI}}
 
 OVERRIDES_SCHEMA = {
     "type": "array",
@@ -75,6 +84,7 @@ TOOLS: List[Dict[str, Any]] = [
             },
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        "_meta": UI_META,
     },
     {
         "name": "make_stitch_plan",
@@ -89,6 +99,7 @@ TOOLS: List[Dict[str, Any]] = [
                                       "description": "Seconds to wait, default %d." % PLAN_WAIT_S}},
         },
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": False},
+        "_meta": UI_META,
     },
     {
         "name": "status",
@@ -99,6 +110,7 @@ TOOLS: List[Dict[str, Any]] = [
             "(stitches, size, threads, warnings) with its picture when one exists."),
         "inputSchema": {"type": "object", "properties": {}},
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
+        "_meta": UI_META,
     },
     {
         "name": "cancel",
@@ -201,12 +213,17 @@ class Tools:
         return self._report(self._call("GET", "/api/status"), "status")
 
     def cancel(self, args: Dict[str, Any]) -> List[Dict[str, Any]]:
-        return [text(self._call("POST", "/api/cancel"))]
+        return [text(self._call("POST", "/api/cancel"))], {}
 
     # -- what a call returns ------------------------------------------------------------
 
-    def _report(self, status: Dict[str, Any], asked: str) -> List[Dict[str, Any]]:
-        """The status, with file paths in place of page URLs, override results and pictures."""
+    def _report(self, status: Dict[str, Any], asked: str):
+        """The status, with file paths in place of page URLs, override results and pictures.
+
+        Returns (content, view): view goes in the result's _meta for the MCP App, which
+        draws the Region map from the SVG and object kinds and cannot fetch files itself.
+        """
+        view: Dict[str, Any] = {"images": []}
         out: Dict[str, Any] = {k: status.get(k) for k in ("state", "stage", "elapsed_s", "error")}
         if status["state"] == "failed":
             out["log_tail"] = status.get("log_tail")
@@ -224,8 +241,13 @@ class Tools:
                 "regions": str(regions or ""),
                 "overrides": self._override_results(sl, regions),
             }
+            svg = self._file(sl["svg_url"])
+            if svg and svg.stat().st_size <= VIEW_SVG_MAX:
+                view["svg"] = svg.read_text(encoding="utf-8", errors="replace")
+            view["kinds"] = self._kinds(regions)
             if asked == "slice" and self._file(sl.get("posterized_url")):
                 images.append(self._file(sl["posterized_url"]))
+                view["images"].append("posterized")
         plan = status.get("stitchplan")
         if plan:
             out["stitchplan"] = dict(
@@ -237,13 +259,25 @@ class Tools:
                 coverage_png=str(self._file(plan["coverage_url"]) or ""))
             if asked != "slice" and self._file(plan["stitchplan_url"]):
                 images.append(self._file(plan["stitchplan_url"]))
+                view["images"].append("stitchplan")
         if status["state"] in server.RUNNING_STATES:
             out["note"] = "Still running. Call status again later."
         content = [text(out)]
         for path in images:
             content.append({"type": "image", "mimeType": "image/png",
                             "data": base64.b64encode(path.read_bytes()).decode("ascii")})
-        return content
+        return content, view
+
+    @staticmethod
+    def _kinds(regions: Optional[Path]) -> Optional[Dict[str, str]]:
+        """Object id -> kind from regions.json, or None (the view then reads the SVG)."""
+        if not regions:
+            return None
+        try:
+            objects = json.loads(regions.read_text(encoding="utf-8")).get("objects") or []
+            return {o["id"]: o["kind"] for o in objects if "id" in o and "kind" in o}
+        except (OSError, ValueError, AttributeError, TypeError, KeyError):
+            return None
 
     @staticmethod
     def _override_results(sl: Dict[str, Any], regions: Optional[Path]) -> List[Dict[str, Any]]:
@@ -273,7 +307,7 @@ class StdioServer:
         self.tools = tools
         self.out = out or sys.stdout
         self.write_lock = threading.Lock()
-        self.handlers: Dict[str, Callable[[Dict[str, Any]], List[Dict[str, Any]]]] = {
+        self.handlers: Dict[str, Callable[[Dict[str, Any]], Any]] = {
             t["name"]: getattr(tools, t["name"]) for t in TOOLS}
 
     def send(self, message: Dict[str, Any]) -> None:
@@ -296,8 +330,11 @@ class StdioServer:
             self.reply(msg_id, error={"code": -32602, "message": "Unknown tool: %s" % name})
             return
         try:
-            content = handler(params.get("arguments") or {})
-            self.reply(msg_id, {"content": content, "isError": False})
+            content, view = handler(params.get("arguments") or {})
+            result: Dict[str, Any] = {"content": content, "isError": False}
+            if view:
+                result["_meta"] = {"digitize/view": view}
+            self.reply(msg_id, result)
         except ToolError as exc:
             self.reply(msg_id, {"content": [{"type": "text", "text": str(exc)}], "isError": True})
         except Exception as exc:                         # a bug: say so, keep the server up
@@ -316,7 +353,8 @@ class StdioServer:
             asked = params.get("protocolVersion")
             self.reply(msg_id, {
                 "protocolVersion": asked if asked in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {},
+                                 "extensions": {"io.modelcontextprotocol/ui": {}}},
                 "serverInfo": SERVER_INFO,
                 "instructions": "Slice a picture to see its Regions and override results, "
                                 "then make_stitch_plan for the VP3 and its Stitch plan.",
@@ -325,6 +363,18 @@ class StdioServer:
             self.reply(msg_id, {})
         elif method == "tools/list":
             self.reply(msg_id, {"tools": TOOLS})
+        elif method == "resources/list":
+            self.reply(msg_id, {"resources": [{"uri": VIEW_URI, "name": "Region map and Stitch plan",
+                                               "mimeType": VIEW_MIME}]})
+        elif method == "resources/read":
+            if params.get("uri") != VIEW_URI:
+                self.reply(msg_id, error={"code": -32002, "message": "Resource not found: %s"
+                                          % params.get("uri")})
+            else:
+                self.reply(msg_id, {"contents": [{
+                    "uri": VIEW_URI, "mimeType": VIEW_MIME,
+                    "text": VIEW_FILE.read_text(encoding="utf-8"),
+                    "_meta": {"ui": {"prefersBorder": True}}}]})
         elif method == "tools/call":
             worker = threading.Thread(target=self.call_tool, args=(msg_id, params), daemon=True)
             worker.start()
